@@ -10,6 +10,7 @@ import {
   Mail,
   MapPin,
   Pencil,
+  Settings as SettingsIcon,
   Sparkles,
   UploadCloud,
 } from "lucide-react";
@@ -40,8 +41,17 @@ const emptyProfile = (user: User): Profile => ({
   resume_profile: {},
   resume_updated_at: null,
   email_digest_enabled: true,
+  email_digest_time: user.email_digest_time ?? "08:00",
   profile_completed: false,
 });
+
+function displayTime(value: string): string {
+  const [hourText, minute = "00"] = value.split(":");
+  const hour = Number(hourText);
+  const period = hour >= 12 ? "PM" : "AM";
+  const displayHour = hour % 12 || 12;
+  return `${displayHour}:${minute} ${period}`;
+}
 
 function Brand() {
   return (
@@ -208,6 +218,8 @@ function ProfileEditor({ initial, onSaved, onLogout }: { initial: Profile; onSav
   const [editing, setEditing] = useState(!initial.profile_completed);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [settingsOpen, setSettingsOpen] = useState(false);
+  const [settingsSaved, setSettingsSaved] = useState(false);
 
   const progress = useMemo(() => (step >= 4 ? 100 : Math.round((step / 3) * 100)), [step]);
   function toggleField(value: TargetField) {
@@ -228,6 +240,7 @@ function ProfileEditor({ initial, onSaved, onLogout }: { initial: Profile; onSav
         sponsorship_required: profile.sponsorship_required,
         freeform_notes: profile.freeform_notes,
         email_digest_enabled: profile.email_digest_enabled,
+        email_digest_time: profile.email_digest_time,
         mark_complete: markComplete,
       }) });
       setProfile(updated); onSaved(updated); setStep(4); setEditing(false);
@@ -235,14 +248,45 @@ function ProfileEditor({ initial, onSaved, onLogout }: { initial: Profile; onSav
     finally { setBusy(false); }
   }
 
+  async function saveSettings() {
+    setBusy(true); setError(""); setSettingsSaved(false);
+    try {
+      const updated = await api<Profile>("/profile/settings", { method: "PUT", body: JSON.stringify({
+        email_digest_enabled: profile.email_digest_enabled,
+        email_digest_time: profile.email_digest_time,
+      }) });
+      setProfile(updated); onSaved(updated); setSettingsSaved(true);
+    } catch (caught) { setError(caught instanceof ApiError ? caught.message : "Could not save your settings."); }
+    finally { setBusy(false); }
+  }
+
+  if (settingsOpen && profile.profile_completed) {
+    return (
+      <div className="app-shell">
+        <header className="app-header"><Brand /><div className="header-actions"><button onClick={() => { setSettingsOpen(false); setError(""); setSettingsSaved(false); }}><ChevronLeft size={15} /> Dashboard</button><button onClick={onLogout}><LogOut size={15} /> Sign out</button></div></header>
+        <main className="settings-page">
+          <section className="settings-heading"><p className="eyebrow">Settings</p><h1>Make the signal fit your day.</h1><p>Choose when your daily digest arrives. Delivery times use Eastern Time.</p></section>
+          <section className="settings-card">
+            <div className="settings-row"><div><h2>Daily email digest</h2><p>Receive one message with your newest matches—or a short update on quiet days.</p></div><label className="switch-control"><input aria-label="Enable daily email digest" type="checkbox" checked={profile.email_digest_enabled} onChange={(event) => { setProfile({ ...profile, email_digest_enabled: event.target.checked }); setSettingsSaved(false); }} /><span /></label></div>
+            <label className="delivery-time">Delivery time <span>Eastern Time</span><input type="time" step="60" value={profile.email_digest_time} disabled={!profile.email_digest_enabled} onChange={(event) => { setProfile({ ...profile, email_digest_time: event.target.value }); setSettingsSaved(false); }} /></label>
+            <div className="settings-preview"><Mail size={18} /><span><small>Next daily window</small><strong>{profile.email_digest_enabled ? displayTime(profile.email_digest_time) : "Digest paused"}</strong></span></div>
+            {error && <p className="form-error" role="alert">{error}</p>}
+            {settingsSaved && <p className="form-success" role="status">Settings saved.</p>}
+            <button className="primary-button settings-save" disabled={busy || !profile.email_digest_time} onClick={saveSettings}>{busy ? "Saving…" : "Save settings"}</button>
+          </section>
+        </main>
+      </div>
+    );
+  }
+
   if (!editing && profile.profile_completed) {
     return (
       <div className="app-shell">
-        <header className="app-header"><Brand /><div className="header-actions"><button onClick={() => { setEditing(true); setStep(1); }}><Pencil size={15} /> Edit profile</button><button onClick={onLogout}><LogOut size={15} /> Sign out</button></div></header>
+        <header className="app-header"><Brand /><div className="header-actions"><button onClick={() => { setSettingsOpen(true); setSettingsSaved(false); }}><SettingsIcon size={15} /> Settings</button><button onClick={() => { setEditing(true); setStep(1); }}><Pencil size={15} /> Edit profile</button><button onClick={onLogout}><LogOut size={15} /> Sign out</button></div></header>
         <main className="dashboard">
           <section className="welcome-block"><p className="eyebrow">Your signal is live</p><h1>We’ll take it from here, {profile.name.split(" ")[0]}.</h1><p>Your profile is matched against new roles throughout the day. One focused digest lands each morning.</p></section>
           <section className="status-grid">
-            <article className="status-card accent"><span className="status-icon"><Mail /></span><div><small>Daily delivery</small><h3>{profile.email_digest_enabled ? "On · 8:00 AM" : "Paused"}</h3><p>{profile.email}</p></div></article>
+            <article className="status-card accent"><span className="status-icon"><Mail /></span><div><small>Daily delivery</small><h3>{profile.email_digest_enabled ? `On · ${displayTime(profile.email_digest_time)}` : "Paused"}</h3><p>{profile.email}</p></div></article>
             <article className="status-card"><span className="status-icon"><BriefcaseBusiness /></span><div><small>Opportunity types</small><h3>{profile.role_types.map((role) => role === "new_grad" ? "New grad" : "Internships").join(" + ")}</h3><p>{profile.target_fields.length} target field{profile.target_fields.length === 1 ? "" : "s"}</p></div></article>
             <article className="status-card"><span className="status-icon"><FileText /></span><div><small>Resume signal</small><h3>{profile.resume_profile.skills?.length ? `${profile.resume_profile.skills.length} skills found` : "Not added"}</h3><p>{profile.resume_profile.experience_level?.replace("_", " ") ?? "Add one anytime"}</p></div></article>
           </section>

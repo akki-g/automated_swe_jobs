@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import pytest
 
@@ -101,3 +101,39 @@ async def test_completed_profile_gets_a_daily_email_even_without_new_matches(
     assert items[0].matches == []
     assert outcome.send.success is True
     assert "No new job matches today" in provider.sent[0][2]
+
+
+@pytest.mark.asyncio
+async def test_email_digest_only_becomes_due_at_user_time_and_once_per_day(
+    db_session, demo_user
+):
+    today = date(2026, 8, 8)
+    demo_user.profile_completed_at = datetime.now(UTC)
+    demo_user.email_digest_enabled = True
+    demo_user.email_digest_time = "17:45"
+    await db_session.flush()
+
+    early = await gather_pending_digests(
+        db_session,
+        channel="email",
+        email_due_time="17:44",
+        email_digest_date=today,
+    )
+    due = await gather_pending_digests(
+        db_session,
+        channel="email",
+        email_due_time="17:45",
+        email_digest_date=today,
+    )
+    demo_user.last_email_digest_sent_on = today
+    await db_session.flush()
+    already_sent = await gather_pending_digests(
+        db_session,
+        channel="email",
+        email_due_time="23:59",
+        email_digest_date=today,
+    )
+
+    assert early == []
+    assert len(due) == 1
+    assert already_sent == []

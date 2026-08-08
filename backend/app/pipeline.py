@@ -3,7 +3,7 @@ from __future__ import annotations
 import asyncio
 import logging
 from dataclasses import dataclass
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, date, datetime, timedelta
 
 from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
@@ -321,12 +321,30 @@ async def match_new_postings(
 
 
 async def gather_pending_digests(
-    session: AsyncSession, channel: str | None = None
+    session: AsyncSession,
+    channel: str | None = None,
+    *,
+    email_due_time: str | None = None,
+    email_digest_date: date | None = None,
 ) -> list[DigestItem]:
     """Collect every un-sent normal-priority match, from either lane, grouped
     by user — the digest cycle's own read, decoupled from whatever cadence
     produced the matches (see spec: Data flow — Digest cycle)."""
     conditions = [User.opted_out.is_(False)]
+    email_user_conditions = [
+        User.email.is_not(None),
+        User.email_digest_enabled.is_(True),
+        User.profile_completed_at.is_not(None),
+    ]
+    if email_due_time is not None:
+        email_user_conditions.append(User.email_digest_time <= email_due_time)
+    if email_digest_date is not None:
+        email_user_conditions.append(
+            or_(
+                User.last_email_digest_sent_on.is_(None),
+                User.last_email_digest_sent_on < email_digest_date,
+            )
+        )
     if channel is None:
         conditions.extend(
             [MatchRow.priority == Priority.NORMAL.value, MatchRow.notified_at.is_(None)]
@@ -336,13 +354,7 @@ async def gather_pending_digests(
             [MatchRow.priority == Priority.NORMAL.value, User.phone.like("+%")]
         )
     elif channel == "email":
-        conditions.extend(
-            [
-                User.email.is_not(None),
-                User.email_digest_enabled.is_(True),
-                User.profile_completed_at.is_not(None),
-            ]
-        )
+        conditions.extend(email_user_conditions)
         # SMS STOP currently sets opted_out. It should pause matching as it
         # always has, but an already-matched posting is still eligible for a
         # user-requested email digest, so remove the SMS-only opt-out filter.
@@ -381,11 +393,7 @@ async def gather_pending_digests(
         eligible_users = (
             (
                 await session.execute(
-                    select(User).where(
-                        User.email.is_not(None),
-                        User.email_digest_enabled.is_(True),
-                        User.profile_completed_at.is_not(None),
-                    )
+                    select(User).where(*email_user_conditions)
                 )
             )
             .scalars()

@@ -43,5 +43,11 @@ def test_web_profile_schema_upgrade_is_additive_and_idempotent():
         schema = inspect(connection)
         user_columns = {column["name"] for column in schema.get_columns("users")}
         criteria_columns = {column["name"] for column in schema.get_columns("criteria")}
-        assert {"password_hash", "profile_completed_at", "email_digest_enabled"} <= user_columns
+        assert {
+            "password_hash",
+            "profile_completed_at",
+            "email_digest_enabled",
+            "email_digest_time",
+            "last_email_digest_sent_on",
+        } <= user_columns
         assert {"target_fields", "resume_profile", "resume_updated_at"} <= criteria_columns

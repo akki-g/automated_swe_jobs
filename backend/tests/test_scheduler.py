@@ -1,5 +1,5 @@
 import asyncio
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
 
 import pytest
 from sqlalchemy import select
@@ -219,6 +219,8 @@ def test_scheduler_keeps_sms_digest_and_adds_daily_email_job():
         "digest_cycle",
         "daily_email_cycle",
     }
+    email_job = next(job for job in scheduler.get_jobs() if job.id == "daily_email_cycle")
+    assert str(email_job.trigger) == "cron[minute='*']"
 
 
 @pytest.mark.asyncio
@@ -230,6 +232,7 @@ async def test_email_recording_merges_with_existing_sms_channel(db):
         stored.notified_at = datetime.now(UTC)
         await session.commit()
 
+    sent_on = date(2026, 8, 8)
     await _record_channel_digest_outcomes(
         [
             ChannelDigestOutcome(
@@ -238,9 +241,12 @@ async def test_email_recording_merges_with_existing_sms_channel(db):
                 channel="email",
                 send=SendOutcome(success=True, provider="resend"),
             )
-        ]
+        ],
+        email_digest_sent_on=sent_on,
     )
 
     async with db() as session:
         refreshed = (await session.execute(select(MatchRow).where(MatchRow.id == match.id))).scalar_one()
         assert set(refreshed.notified_channels) == {"sms", "email"}
+        refreshed_user = (await session.execute(select(User).where(User.id == user.id))).scalar_one()
+        assert refreshed_user.last_email_digest_sent_on == sent_on

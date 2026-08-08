@@ -1,9 +1,10 @@
 from __future__ import annotations
 
-from datetime import datetime
+from datetime import date, datetime
 
 from sqlalchemy import (
     Boolean,
+    Date,
     DateTime,
     Float,
     ForeignKey,
@@ -36,6 +37,8 @@ class User(Base):
         DateTime(timezone=True), nullable=True
     )
     email_digest_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    email_digest_time: Mapped[str] = mapped_column(String(5), default="08:00")
+    last_email_digest_sent_on: Mapped[date | None] = mapped_column(Date, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
     criteria: Mapped["Criteria | None"] = relationship(back_populates="user", uselist=False)
