@@ -6,14 +6,21 @@ from datetime import UTC, datetime
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
-from sqlalchemy import update
+from sqlalchemy import select
 
 from app.config import settings
 from app.db.models import Match as MatchRow
 from app.db.models import Message as MessageRow
 from app.db.session import session_scope
 from app.matching.rank import AnthropicMessagesClient
-from app.notify.dispatch import DigestItem, DigestOutcome, SendOutcome, send_digests, send_instants
+from app.notify.dispatch import (
+    ChannelDigestOutcome,
+    DigestOutcome,
+    SendOutcome,
+    send_email_digests,
+    send_instants,
+    send_sms_digests,
+)
 from app.notify.email_resend import ResendEmailProvider
 from app.notify.sms.signalwire import SignalWireSmsProvider
 from app.pipeline import (
@@ -45,12 +52,16 @@ async def default_sources(session) -> list[Source]:
     return await reliable_tier_sources(session)
 
 
-def _mark_notified_stmt(match_ids: list[int], channels: list[str]):
-    return (
-        update(MatchRow)
-        .where(MatchRow.id.in_(match_ids))
-        .values(notified_at=datetime.now(UTC), notified_channels=channels)
-    )
+async def _mark_channels_delivered(session, match_ids: list[int], channels: list[str]) -> None:
+    if not match_ids:
+        return
+    rows = (
+        await session.execute(select(MatchRow).where(MatchRow.id.in_(match_ids)))
+    ).scalars().all()
+    now = datetime.now(UTC)
+    for row in rows:
+        row.notified_channels = sorted(set(row.notified_channels or []).union(channels))
+        row.notified_at = row.notified_at or now
 
 
 async def _record_instant_outcomes(
@@ -90,7 +101,7 @@ async def _record_instant_outcomes(
                     outcome.error,
                 )
         if succeeded_ids:
-            await session.execute(_mark_notified_stmt(succeeded_ids, ["sms"]))
+            await _mark_channels_delivered(session, succeeded_ids, ["sms"])
         await session.commit()
 
 
@@ -104,24 +115,25 @@ async def _record_digest_outcomes(outcomes: list[DigestOutcome]) -> None:
     now = datetime.now(UTC)
     async with session_scope() as session:
         for outcome in outcomes:
-            if outcome.sms.skipped:
-                # Opted-out user or nothing to send — nothing was attempted,
-                # so nothing to log or mark notified.
+            if outcome.sms.skipped and (outcome.email is None or outcome.email.skipped):
+                # Neither channel was attempted, so there is nothing to log
+                # or mark delivered.
                 continue
 
             channels: list[str] = []
-            session.add(
-                MessageRow(
-                    user_id=outcome.user.id,
-                    match_id=None,
-                    direction="outbound",
-                    channel="sms",
-                    provider=outcome.sms.provider,
-                    body=f"digest: {len(outcome.matches)} match(es)",
-                    status="sent" if outcome.sms.success else "failed",
-                    created_at=now,
+            if not outcome.sms.skipped:
+                session.add(
+                    MessageRow(
+                        user_id=outcome.user.id,
+                        match_id=None,
+                        direction="outbound",
+                        channel="sms",
+                        provider=outcome.sms.provider,
+                        body=f"digest: {len(outcome.matches)} match(es)",
+                        status="sent" if outcome.sms.success else "failed",
+                        created_at=now,
+                    )
                 )
-            )
             if outcome.sms.success:
                 channels.append("sms")
 
@@ -152,7 +164,43 @@ async def _record_digest_outcomes(outcomes: list[DigestOutcome]) -> None:
 
             match_ids = [match_row.id for match_row, _posting_row in outcome.matches]
             if match_ids:
-                await session.execute(_mark_notified_stmt(match_ids, channels))
+                await _mark_channels_delivered(session, match_ids, channels)
+        await session.commit()
+
+
+async def _record_channel_digest_outcomes(outcomes: list[ChannelDigestOutcome]) -> None:
+    if not outcomes:
+        return
+    now = datetime.now(UTC)
+    async with session_scope() as session:
+        for outcome in outcomes:
+            if outcome.send.skipped:
+                continue
+            session.add(
+                MessageRow(
+                    user_id=outcome.user.id,
+                    match_id=None,
+                    direction="outbound",
+                    channel=outcome.channel,
+                    provider=outcome.send.provider,
+                    body=f"digest: {len(outcome.matches)} match(es)",
+                    status="sent" if outcome.send.success else "failed",
+                    created_at=now,
+                )
+            )
+            if outcome.send.success:
+                await _mark_channels_delivered(
+                    session,
+                    [match_row.id for match_row, _posting_row in outcome.matches],
+                    [outcome.channel],
+                )
+            else:
+                logger.warning(
+                    "%s digest delivery failed for user_id=%s: %s",
+                    outcome.channel,
+                    outcome.user.id,
+                    outcome.send.error,
+                )
         await session.commit()
 
 
@@ -229,25 +277,36 @@ async def slow_lane_cycle() -> MatchCycleResult:
     return await _process_new_postings(sources, lane="slow", sms_provider=sms_provider)
 
 
-async def digest_cycle() -> list[DigestOutcome]:
-    """Gather every un-sent normal-priority match (from either lane) and send
-    one digest per user (see spec: Notifications, Data flow)."""
+async def digest_cycle() -> list[ChannelDigestOutcome]:
+    """Legacy 08:00/20:00 SMS digest, retained for SMS-opted-in users."""
     sms_provider = SignalWireSmsProvider()
-    email_provider = ResendEmailProvider()
 
     async with session_scope() as session:
-        digest_items = await gather_pending_digests(session)
+        digest_items = await gather_pending_digests(session, channel="sms")
 
     if not digest_items:
         return []
 
-    outcomes = await send_digests(digest_items, sms_provider, email_provider)
-    await _record_digest_outcomes(outcomes)
+    outcomes = await send_sms_digests(digest_items, sms_provider)
+    await _record_channel_digest_outcomes(outcomes)
+    return outcomes
+
+
+async def daily_email_cycle() -> list[ChannelDigestOutcome]:
+    """Send each completed web profile one email containing matches not yet
+    delivered by email. Matching cadence stays owned by the fast/slow lanes."""
+    email_provider = ResendEmailProvider()
+    async with session_scope() as session:
+        digest_items = await gather_pending_digests(session, channel="email")
+    if not digest_items:
+        return []
+    outcomes = await send_email_digests(digest_items, email_provider)
+    await _record_channel_digest_outcomes(outcomes)
     return outcomes
 
 
 def build_scheduler() -> AsyncIOScheduler:
-    scheduler = AsyncIOScheduler()
+    scheduler = AsyncIOScheduler(timezone=settings.scheduler_timezone)
     scheduler.add_job(
         fast_lane_cycle,
         "interval",
@@ -264,8 +323,14 @@ def build_scheduler() -> AsyncIOScheduler:
     )
     scheduler.add_job(
         digest_cycle,
-        CronTrigger(hour=settings.digest_hours),
+        CronTrigger(hour=settings.digest_hours, timezone=settings.scheduler_timezone),
         id="digest_cycle",
+        max_instances=1,
+    )
+    scheduler.add_job(
+        daily_email_cycle,
+        CronTrigger(hour=settings.daily_email_hour, timezone=settings.scheduler_timezone),
+        id="daily_email_cycle",
         max_instances=1,
     )
     return scheduler

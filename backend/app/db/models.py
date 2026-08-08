@@ -25,12 +25,17 @@ class User(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(120))
-    phone: Mapped[str] = mapped_column(String(20), unique=True, index=True)
-    email: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    phone: Mapped[str | None] = mapped_column(String(20), unique=True, index=True, nullable=True)
+    email: Mapped[str | None] = mapped_column(String(255), unique=True, index=True, nullable=True)
+    password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
     sms_provider: Mapped[str] = mapped_column(String(20), default="signalwire")
     opted_out: Mapped[bool] = mapped_column(Boolean, default=False)
     consent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     consent_method: Mapped[str] = mapped_column(String(50), default="verbal-friend-onboarding")
+    profile_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    email_digest_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
     criteria: Mapped["Criteria | None"] = relationship(back_populates="user", uselist=False)
@@ -42,11 +47,16 @@ class Criteria(Base):
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"), unique=True)
     role_types: Mapped[list[str]] = mapped_column(JSON, default=list)
+    target_fields: Mapped[list[str]] = mapped_column(JSON, default=list)
     keywords: Mapped[list[str]] = mapped_column(JSON, default=list)
     locations: Mapped[list[str]] = mapped_column(JSON, default=list)
     sponsorship_required: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
     min_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     freeform_notes: Mapped[str] = mapped_column(String(2000), default="")
+    resume_profile: Mapped[dict] = mapped_column(JSON, default=dict)
+    resume_updated_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
     user: Mapped["User"] = relationship(back_populates="criteria")

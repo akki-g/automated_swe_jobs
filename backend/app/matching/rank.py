@@ -104,7 +104,10 @@ def _extract_tool_input(response: dict, tool_name: str) -> dict:
 def _build_prompt(postings: list[Posting], criteria: Criteria) -> tuple[str, list[dict]]:
     system = (
         "You score how well candidate job postings fit a job seeker's stated "
-        "criteria for new-grad software engineering or internship roles. "
+        "target career fields and new-graduate or internship preferences. "
+        "Use the structured resume signals as supporting evidence, while "
+        "treating the seeker's explicitly selected target fields and criteria "
+        "as authoritative. Do not infer fit from protected characteristics. "
         "Score strictly: 1.0 only for an excellent, unambiguous fit."
     )
     postings_payload = [
@@ -119,10 +122,12 @@ def _build_prompt(postings: list[Posting], criteria: Criteria) -> tuple[str, lis
     ]
     criteria_payload = {
         "role_types": [rt.value for rt in criteria.role_types],
+        "target_fields": [field.value for field in criteria.target_fields],
         "keywords": list(criteria.keywords),
         "locations": list(criteria.locations),
         "sponsorship_required": criteria.sponsorship_required,
         "freeform_notes": criteria.freeform_notes,
+        "resume_profile": criteria.resume_profile,
     }
     user_message = (
         f"Criteria: {json.dumps(criteria_payload)}\n\n"

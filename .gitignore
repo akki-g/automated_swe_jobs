@@ -6,3 +6,8 @@ __pycache__/
 .pytest_cache/
 *.db
 .venv/
+node_modules/
+dist/
+*.tsbuildinfo
+output/
+.playwright-cli/

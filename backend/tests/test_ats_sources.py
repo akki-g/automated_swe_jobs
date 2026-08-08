@@ -8,11 +8,14 @@ from app.sources.ats.lever import LeverSource
 def test_infer_role_type_intern():
     assert infer_role_type("Software Engineering Intern") == RoleType.INTERN
     assert infer_role_type("Summer Co-op - Firmware") == RoleType.INTERN
+    assert infer_role_type("2027 Summer Analyst") == RoleType.INTERN
 
 
 def test_infer_role_type_new_grad():
     assert infer_role_type("New Grad Software Engineer") == RoleType.NEW_GRAD
     assert infer_role_type("Entry-Level Backend Engineer") == RoleType.NEW_GRAD
+    assert infer_role_type("2027 Analyst, Liquid Structured Credit") == RoleType.NEW_GRAD
+    assert infer_role_type("Marketing Graduate Program") == RoleType.NEW_GRAD
 
 
 def test_infer_role_type_unclassified():
