@@ -10,6 +10,18 @@ class RoleType(str, Enum):
     INTERN = "intern"
 
 
+class TargetField(str, Enum):
+    SOFTWARE_ENGINEERING = "software_engineering"
+    DATA_SCIENCE_ANALYTICS = "data_science_analytics"
+    PRODUCT_MANAGEMENT = "product_management"
+    FINANCE_INVESTMENT_BANKING = "finance_investment_banking"
+    CONSULTING = "consulting"
+    MARKETING = "marketing"
+    SALES = "sales"
+    OPERATIONS = "operations"
+    DESIGN = "design"
+
+
 class PostingStatus(str, Enum):
     OPEN = "open"
     STALE = "stale"
@@ -54,11 +66,13 @@ class Posting:
 class Criteria:
     user_id: int
     role_types: tuple[RoleType, ...] = ()
+    target_fields: tuple[TargetField, ...] = ()
     keywords: tuple[str, ...] = ()
     locations: tuple[str, ...] = ()
     sponsorship_required: bool | None = None
     min_date: datetime | None = None
     freeform_notes: str = ""
+    resume_profile: dict = field(default_factory=dict)
 
 
 @dataclass(frozen=True)

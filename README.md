@@ -1,11 +1,48 @@
 # automated_swe_jobs
 
-Scrapes new-grad SWE and internship postings from many sources, matches them
-against each user's criteria, and alerts by SMS and email. A conversational
-assistant (over SMS) lets users refine their criteria, search postings, and
-track specific companies on a watchlist.
+Finds new-grad and internship postings across software, data, product,
+finance, consulting, marketing, sales, operations, and design; matches them
+to each user's profile; and sends a focused daily email. A web signup and
+questionnaire are now the primary onboarding path. The existing instant SMS,
+SMS assistant, and company-watchlist paths remain intact while A2P approval is
+pending.
 
 Full design: `docs/superpowers/specs/2026-08-07-automated-swe-jobs-design.md`.
+
+## Web onboarding expansion
+
+- **Web client:** a responsive Vite/React/TypeScript app in `frontend/` with
+  signup/login, a three-step profile questionnaire, privacy-explicit resume
+  upload, inferred-field suggestions, and a profile dashboard.
+- **Auth:** email/password with Argon2 hashes, signed HttpOnly session cookies,
+  SameSite protection, and a double-submit CSRF token. Signup writes real
+  `consent_at` and `web-signup-terms-v1` consent metadata. Phone is optional.
+- **Target-field taxonomy:** structured fields cover software engineering,
+  data/analytics, product, finance/investment banking, consulting, marketing,
+  sales, operations, and design. The user's explicit choices remain
+  authoritative during Claude ranking.
+- **Resume minimization:** PDF uses `pypdf`; DOCX uses `python-docx`. Uploads
+  are limited to 5 MB and processed from memory. Claude returns only bounded
+  skills, past titles, experience signal, inferred fields, education fields,
+  and a short summary. Only that structured JSON is persisted; raw bytes and
+  extracted text are never stored or logged. Re-upload replaces the result.
+- **Daily email:** `daily_email_cycle` sends completed profiles one email at
+  08:00 in the configured timezone. The legacy 08:00/20:00 SMS digest remains
+  separate. Delivery state is channel-aware, so delivery on one channel does
+  not suppress another.
+- **Workday:** 14 live-verified Workday boards expand the curated source set
+  across banking, investing, consulting, consumer goods, retail, payments,
+  media, and generalist employers. Workday enforces 20 results per page, so
+  the adapter explicitly caps each board at its newest 200 roles per sweep;
+  tune `max_pages` per entry if broader coverage is worth the request volume.
+- **Deployment:** development and hardened production Compose files run
+  Postgres + one API/scheduler process + an nginx-served web client. Keeping
+  APScheduler in the single API container avoids duplicate jobs and remains
+  appropriate for the stated 30-user target (and the existing hundreds-user
+  headroom).
+
+Implementation decisions and staging are recorded in
+`docs/superpowers/plans/2026-08-08-web-onboarding-and-daily-email-plan.md`.
 
 ## What's built (working MVP)
 
@@ -13,8 +50,8 @@ This implements the spec's full Phase 1 build order (steps 1–6), plus a
 post-review hardening pass and a new company-watchlist feature.
 
 - **Sources** (`app/sources/`): SimplifyJobs New-Grad-Positions and
-  Summer-Internships GitHub lists; Greenhouse/Lever/Ashby ATS adapters driven
-  by a curated `companies.yaml` — **32 companies**, every slug live-verified
+  Summer-Internships GitHub lists; Greenhouse/Lever/Ashby/Workday ATS adapters driven
+  by a curated `companies.yaml` — **46 companies**, every entry live-verified
   against the provider's real public API during this build (see "Testing"
   below); a generic RSS/JSON aggregator adapter (`RssFeedSource`,
   unconfigured by default — add a feed URL to use it). All reliable-tier
@@ -57,15 +94,16 @@ post-review hardening pass and a new company-watchlist feature.
   criteria filters, but are always instant-priority once matched. If no
   board is found, the user is told rather than the system silently doing
   nothing.
-- **Scheduler** (`app/scheduler.py`): three independent APScheduler jobs —
+- **Scheduler** (`app/scheduler.py`): four independent APScheduler jobs —
   `fast_lane_cycle` (~2 min, reliable-tier + watchlist sources,
   change-detection first), `slow_lane_cycle` (~15 min, full sweep +
-  staleness marking, the correctness backstop), and `digest_cycle` (cron,
-  default 8am/8pm) which reads *all* un-sent normal-priority matches from
-  either lane and sends them — decoupled from scrape cadence, per spec.
+  staleness marking, the correctness backstop), the legacy `digest_cycle`
+  (SMS at 8am/8pm), and `daily_email_cycle` (email at 8am) — all delivery is
+  decoupled from scrape cadence.
 - **DB** (`app/db/`): `users`, `criteria`, `postings`, `matches`, `messages`,
   `watchlist` via SQLAlchemy async + `create_all` (no Alembic, matching
-  Posted's convention). `store_new_postings` catches `IntegrityError` from a
+  Posted's convention). A narrow idempotent startup migration adds the web
+  profile columns to existing Phase-1 databases. `store_new_postings` catches `IntegrityError` from a
   same-`posting_key` race between lanes and retries the *whole* pass
   (including `last_seen_at` bumps on already-known postings in the same
   batch, not just the new-row insert) against the post-race DB state rather
@@ -236,12 +274,12 @@ the proxy-header note above.
 
 ## Quick start
 
-Requirements: Python 3.12+, [uv](https://docs.astral.sh/uv/).
+Requirements: Python 3.12+, Node 22+, [uv](https://docs.astral.sh/uv/).
 
 ```bash
 cd backend
 uv sync
-cp ../.env.example ../.env   # fill in SignalWire, Resend, Anthropic creds
+cp ../.env.example ../.env   # fill in auth, Resend, and Anthropic values
 uv run python scripts/seed_demo.py        # seeds one demo user + criteria
 uv run python scripts/run_scrape_once.py  # dry-run: scrape, rank, match, print — no sends
 ```
@@ -253,12 +291,43 @@ cd backend
 uv run pytest
 ```
 
-Run the service (FastAPI + all three scheduler jobs):
+Run the API (FastAPI + all four scheduler jobs):
 
 ```bash
 cd backend
 uv run uvicorn app.main:app --reload
 ```
+
+Run the web app in a second terminal:
+
+```bash
+cd frontend
+npm install
+npm run dev
+```
+
+Then open `http://localhost:5173`. Vite proxies `/api` to port 8000.
+
+Or run the complete local stack with Postgres:
+
+```bash
+docker compose up --build
+```
+
+The web app is at `http://localhost:5173`; the API health endpoint is at
+`http://localhost:8000/health`.
+
+Production uses the same single-API/scheduler topology:
+
+```bash
+docker network create portfolio-edge  # once per host
+docker compose -f compose.production.yml up -d --build
+```
+
+Set every required `${VAR:?...}` value in the root `.env` first. Configure the
+shared edge proxy to route the public hostname to the `automated-jobs-web`
+network alias. Do not scale the API service above one replica while
+APScheduler runs in-process.
 
 Confirm secrets are present without printing them:
 
@@ -275,7 +344,7 @@ your shell already, `check_keys.py` will report them as "set" even without a
 
 ## Testing
 
-112 automated tests, all passing (`uv run pytest`):
+133 automated tests, all passing (`uv run pytest`):
 - Pure logic: `normalize`, `dedupe`, `filters` (including the sponsorship
   hard filter), `rank.compute_priority`, `infer_role_type`, ATS/RSS payload
   parsing, digest formatting, watchlist slug-candidate generation.
@@ -286,6 +355,10 @@ your shell already, `check_keys.py` will report them as "set" even without a
   regression, the watchlist-forces-instant-priority behavior, the
   `IntegrityError` retry path, and scheduler-level delivery-outcome
   recording (`_record_instant_outcomes`/`_record_digest_outcomes`).
+- Web/API: signup consent, password hashing, cookie/CSRF enforcement, strict
+  profile updates, in-memory DOCX parsing, structured-only resume persistence,
+  Workday pagination/change detection, generalized ranking inputs, and
+  independent SMS/email pending-delivery behavior.
 - Source registry: instance-persistence-across-cycles regression (the exact
   bug that broke the fast lane's change detection — see `test_source_registry.py`).
 - HTTP-level: the real webhook endpoint via FastAPI's `TestClient`
@@ -314,6 +387,7 @@ build, each re-run to confirm idempotency:
 See the design doc for full rationale. Module boundaries match the target
 shape exactly: `sources/` (plus `sources/registry.py` for cross-cycle
 instance persistence), `ingest/`, `matching/`, `notify/`, `assistant/`,
-`watchlist/` (new), plus `scheduler.py`, `webhooks.py`, and `pipeline.py`
+`watchlist/`, `resume/`, `auth/`, and `api/`, plus `scheduler.py`,
+`webhooks.py`, and `pipeline.py`
 (I/O orchestration gluing the pure modules together, kept separate from them
 per the design's isolation principle).

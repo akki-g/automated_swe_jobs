@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.models import Criteria as CriteriaRow
 from app.db.models import Posting as PostingRow
-from app.domain.models import RoleType
+from app.domain.models import RoleType, TargetField
 from app.watchlist import service as watchlist_service
 
 TOOL_SCHEMAS = [
@@ -39,6 +39,13 @@ TOOL_SCHEMAS = [
             "type": "object",
             "properties": {
                 "role_types": {"type": "array", "items": {"type": "string", "enum": ["new_grad", "intern"]}},
+                "target_fields": {
+                    "type": "array",
+                    "items": {
+                        "type": "string",
+                        "enum": [field.value for field in TargetField],
+                    },
+                },
                 "keywords": {"type": "array", "items": {"type": "string"}},
                 "locations": {"type": "array", "items": {"type": "string"}},
                 "sponsorship_required": {"type": "boolean"},
@@ -78,6 +85,7 @@ TOOL_SCHEMAS = [
 ]
 
 _VALID_ROLE_TYPES = {rt.value for rt in RoleType}
+_VALID_TARGET_FIELDS = {field.value for field in TargetField}
 
 
 def _validate_criteria_changes(changes: dict) -> tuple[dict, list[str]]:
@@ -96,6 +104,15 @@ def _validate_criteria_changes(changes: dict) -> tuple[dict, list[str]]:
         if dropped:
             warnings.append(f"ignored unrecognized role_types: {dropped!r}")
         clean["role_types"] = valid
+
+    if "target_fields" in changes:
+        raw = changes["target_fields"]
+        values = raw if isinstance(raw, list) else [raw]
+        valid = [value for value in values if isinstance(value, str) and value in _VALID_TARGET_FIELDS]
+        dropped = [value for value in values if value not in valid]
+        if dropped:
+            warnings.append(f"ignored unrecognized target_fields: {dropped!r}")
+        clean["target_fields"] = valid
 
     for key in ("keywords", "locations"):
         if key in changes:
@@ -150,6 +167,7 @@ async def get_criteria(session: AsyncSession, user_id: int) -> dict:
         return {}
     return {
         "role_types": row.role_types,
+        "target_fields": row.target_fields,
         "keywords": row.keywords,
         "locations": row.locations,
         "sponsorship_required": row.sponsorship_required,
@@ -171,15 +189,19 @@ async def update_criteria(session: AsyncSession, user_id: int, changes: dict) ->
         row = CriteriaRow(
             user_id=user_id,
             role_types=[],
+            target_fields=[],
             keywords=[],
             locations=[],
             sponsorship_required=None,
             freeform_notes="",
+            resume_profile={},
             updated_at=datetime.now(UTC),
         )
 
     if "role_types" in clean_changes:
         row.role_types = clean_changes["role_types"]
+    if "target_fields" in clean_changes:
+        row.target_fields = clean_changes["target_fields"]
     if "keywords" in clean_changes:
         row.keywords = clean_changes["keywords"]
     if "locations" in clean_changes:

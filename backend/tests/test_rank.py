@@ -3,8 +3,13 @@ from datetime import UTC, datetime
 
 import pytest
 
-from app.domain.models import Criteria, Posting, Priority, RoleType
-from app.matching.rank import _RANK_BATCH_SIZE, compute_priority, rank_postings
+from app.domain.models import Criteria, Posting, Priority, RoleType, TargetField
+from app.matching.rank import (
+    _RANK_BATCH_SIZE,
+    _build_prompt,
+    compute_priority,
+    rank_postings,
+)
 
 
 def _posting(**overrides) -> Posting:
@@ -164,6 +169,21 @@ def test_compute_priority_normal_below_threshold():
 
 def test_compute_priority_at_threshold_is_high():
     assert compute_priority(0.9) == Priority.HIGH
+
+
+def test_ranking_prompt_uses_target_fields_and_structured_resume_signals():
+    criteria = Criteria(
+        user_id=1,
+        target_fields=(TargetField.CONSULTING,),
+        resume_profile={"skills": ["market sizing"], "experience_level": "student"},
+    )
+
+    system, messages = _build_prompt([_posting()], criteria)
+
+    assert "software engineering" not in system
+    assert "target career fields" in system
+    assert '"target_fields": ["consulting"]' in messages[0]["content"]
+    assert '"skills": ["market sizing"]' in messages[0]["content"]
 
 
 # Sponsorship is now a hard rule filter (app.matching.filters), not a

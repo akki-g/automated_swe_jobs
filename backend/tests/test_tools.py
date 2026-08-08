@@ -101,6 +101,7 @@ def test_validate_criteria_changes_accepts_well_formed_input():
     clean, warnings = _validate_criteria_changes(
         {
             "role_types": ["new_grad", "intern"],
+            "target_fields": ["consulting", "finance_investment_banking"],
             "keywords": ["backend"],
             "locations": ["remote"],
             "sponsorship_required": True,
@@ -109,6 +110,7 @@ def test_validate_criteria_changes_accepts_well_formed_input():
     )
     assert clean == {
         "role_types": ["new_grad", "intern"],
+        "target_fields": ["consulting", "finance_investment_banking"],
         "keywords": ["backend"],
         "locations": ["remote"],
         "sponsorship_required": True,

@@ -5,7 +5,7 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
@@ -15,7 +15,7 @@ from app.db.models import Criteria as CriteriaRow
 from app.db.models import Match as MatchRow
 from app.db.models import Posting as PostingRow
 from app.db.models import User
-from app.domain.models import Criteria, Posting, Priority, RoleType
+from app.domain.models import Criteria, Posting, Priority, RoleType, TargetField
 from app.ingest.dedupe import dedupe_postings, filter_new
 from app.ingest.normalize import normalize, normalize_company_key
 from app.matching.filters import filter_postings
@@ -148,11 +148,13 @@ def _criteria_row_to_domain(row: CriteriaRow) -> Criteria:
     return Criteria(
         user_id=row.user_id,
         role_types=tuple(RoleType(rt) for rt in row.role_types),
+        target_fields=tuple(TargetField(field) for field in row.target_fields),
         keywords=tuple(row.keywords),
         locations=tuple(row.locations),
         sponsorship_required=row.sponsorship_required,
         min_date=row.min_date,
         freeform_notes=row.freeform_notes,
+        resume_profile=row.resume_profile or {},
     )
 
 
@@ -213,7 +215,13 @@ async def match_new_postings(
         (
             await session.execute(
                 select(User)
-                .where(User.opted_out.is_(False))
+                .where(
+                    User.opted_out.is_(False),
+                    # Legacy SMS users have no password hash and remain
+                    # eligible exactly as before. Web users do not enter the
+                    # expensive rank/match loop until onboarding is complete.
+                    or_(User.password_hash.is_(None), User.profile_completed_at.is_not(None)),
+                )
                 .options(selectinload(User.criteria))
             )
         )
@@ -312,21 +320,44 @@ async def match_new_postings(
     return MatchCycleResult(instant=instant, digest_items=digest_items)
 
 
-async def gather_pending_digests(session: AsyncSession) -> list[DigestItem]:
+async def gather_pending_digests(
+    session: AsyncSession, channel: str | None = None
+) -> list[DigestItem]:
     """Collect every un-sent normal-priority match, from either lane, grouped
     by user — the digest cycle's own read, decoupled from whatever cadence
     produced the matches (see spec: Data flow — Digest cycle)."""
+    conditions = [User.opted_out.is_(False)]
+    if channel is None:
+        conditions.extend(
+            [MatchRow.priority == Priority.NORMAL.value, MatchRow.notified_at.is_(None)]
+        )
+    elif channel == "sms":
+        conditions.extend(
+            [MatchRow.priority == Priority.NORMAL.value, User.phone.like("+%")]
+        )
+    elif channel == "email":
+        conditions.extend(
+            [
+                User.email.is_not(None),
+                User.email_digest_enabled.is_(True),
+                User.profile_completed_at.is_not(None),
+            ]
+        )
+        # SMS STOP currently sets opted_out. It should pause matching as it
+        # always has, but an already-matched posting is still eligible for a
+        # user-requested email digest, so remove the SMS-only opt-out filter.
+        conditions = conditions[1:]
+    else:
+        raise ValueError(f"unsupported digest channel: {channel}")
+
     rows = (
         (
             await session.execute(
                 select(MatchRow, PostingRow, User)
                 .join(PostingRow, MatchRow.posting_id == PostingRow.id)
                 .join(User, MatchRow.user_id == User.id)
-                .where(
-                    MatchRow.priority == Priority.NORMAL.value,
-                    MatchRow.notified_at.is_(None),
-                    User.opted_out.is_(False),
-                )
+                .where(*conditions)
+                .order_by(MatchRow.created_at, MatchRow.id)
             )
         )
         .all()
@@ -334,10 +365,33 @@ async def gather_pending_digests(session: AsyncSession) -> list[DigestItem]:
 
     by_user: dict[int, DigestItem] = {}
     for match_row, posting_row, user in rows:
+        if channel is not None and channel in (match_row.notified_channels or []):
+            continue
         item = by_user.get(user.id)
         if item is None:
             item = DigestItem(user=user, matches=[])
             by_user[user.id] = item
         item.matches.append((match_row, posting_row))
+
+    if channel == "email":
+        # The product promise is one daily email for every completed profile,
+        # including a concise no-new-matches note on quiet days. The joined
+        # query above cannot return users with zero pending rows, so union in
+        # all eligible recipients after grouping the real matches.
+        eligible_users = (
+            (
+                await session.execute(
+                    select(User).where(
+                        User.email.is_not(None),
+                        User.email_digest_enabled.is_(True),
+                        User.profile_completed_at.is_not(None),
+                    )
+                )
+            )
+            .scalars()
+            .all()
+        )
+        for user in eligible_users:
+            by_user.setdefault(user.id, DigestItem(user=user, matches=[]))
 
     return list(by_user.values())

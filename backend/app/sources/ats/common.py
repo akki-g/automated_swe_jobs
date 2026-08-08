@@ -4,9 +4,15 @@ import re
 
 from app.domain.models import RoleType
 
-_INTERN_PATTERN = re.compile(r"\bintern(ship)?\b|\bco-?op\b", re.IGNORECASE)
+_INTERN_PATTERN = re.compile(
+    r"\bintern(ship)?\b|\bco-?op\b|\bsummer\s+(?:analyst|associate)\b",
+    re.IGNORECASE,
+)
 _NEW_GRAD_PATTERN = re.compile(
-    r"\bnew\s*grad(uate)?\b|\bentry[\s-]?level\b|\buniversity\s*grad(uate)?\b|\bearly[\s-]?career\b",
+    r"\bnew\s*grad(uate)?\b|\bentry[\s-]?level\b|\buniversity\s*grad(uate)?\b|"
+    r"\bearly[\s-]?career\b|\bgraduate\s+(?:role|program(?:me)?|scheme)\b|"
+    r"\b(?:management|managerial)\s+trainee\b|"
+    r"\b20\d{2}\s+(?:full[\s-]?time\s+)?(?:analyst|associate)\b",
     re.IGNORECASE,
 )
 

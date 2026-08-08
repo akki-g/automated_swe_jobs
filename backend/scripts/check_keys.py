@@ -1,8 +1,9 @@
 """Confirm required secrets are present in .env without printing their values."""
 
-from app.config import settings
+from app.config import DEV_AUTH_SECRET, settings
 
 CHECKS = {
+    "AUTH_SECRET": settings.auth_secret if settings.auth_secret != DEV_AUTH_SECRET else "",
     "ANTHROPIC_API_KEY": settings.anthropic_api_key,
     "SIGNALWIRE_SPACE": settings.signalwire_space,
     "SIGNALWIRE_PROJECT_ID": settings.signalwire_project_id,

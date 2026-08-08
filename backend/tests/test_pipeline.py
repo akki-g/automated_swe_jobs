@@ -178,6 +178,32 @@ async def test_match_new_postings_skips_posting_with_no_rank_result(db_session, 
 
 
 @pytest.mark.asyncio
+async def test_incomplete_web_profile_is_not_ranked(db_session, demo_user):
+    demo_user.password_hash = "argon2-placeholder"
+    demo_user.profile_completed_at = None
+    db_session.add(
+        CriteriaRow(
+            user_id=demo_user.id,
+            role_types=[],
+            target_fields=[],
+            keywords=[],
+            locations=[],
+            sponsorship_required=None,
+            freeform_notes="",
+            updated_at=datetime.now(UTC),
+        )
+    )
+    posting = _posting()
+    new_rows = await store_new_postings(db_session, [posting])
+
+    result = await match_new_postings(db_session, new_rows, FakeRankClient(), lane="slow")
+
+    assert result.instant == []
+    assert result.digest_items == []
+    assert (await db_session.execute(select(MatchRow))).scalars().all() == []
+
+
+@pytest.mark.asyncio
 async def test_match_new_postings_forces_instant_priority_for_watchlisted_company(db_session, demo_user):
     """A posting from a company the user is actively watching is always
     instant, regardless of its LLM score — see spec addendum: watchlist

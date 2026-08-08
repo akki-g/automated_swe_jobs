@@ -10,8 +10,14 @@ from app.db.models import Match as MatchRow
 from app.db.models import Message as MessageRow
 from app.db.models import Posting as PostingRow
 from app.db.models import User
-from app.notify.dispatch import DigestOutcome, SendOutcome
-from app.scheduler import _record_digest_outcomes, _record_instant_outcomes, reliable_tier_sources
+from app.notify.dispatch import ChannelDigestOutcome, DigestOutcome, SendOutcome
+from app.scheduler import (
+    _record_channel_digest_outcomes,
+    _record_digest_outcomes,
+    _record_instant_outcomes,
+    build_scheduler,
+    reliable_tier_sources,
+)
 from app.sources.registry import registry
 
 
@@ -202,3 +208,39 @@ async def test_reliable_tier_sources_reuses_same_instances_across_calls(db):
 
     assert first  # sanity: companies.yaml actually has entries
     assert [id(s) for s in first] == [id(s) for s in second]
+
+
+def test_scheduler_keeps_sms_digest_and_adds_daily_email_job():
+    scheduler = build_scheduler()
+
+    assert {job.id for job in scheduler.get_jobs()} == {
+        "fast_lane_cycle",
+        "slow_lane_cycle",
+        "digest_cycle",
+        "daily_email_cycle",
+    }
+
+
+@pytest.mark.asyncio
+async def test_email_recording_merges_with_existing_sms_channel(db):
+    user, match, posting = await _seed(db)
+    async with db() as session:
+        stored = (await session.execute(select(MatchRow).where(MatchRow.id == match.id))).scalar_one()
+        stored.notified_channels = ["sms"]
+        stored.notified_at = datetime.now(UTC)
+        await session.commit()
+
+    await _record_channel_digest_outcomes(
+        [
+            ChannelDigestOutcome(
+                user=user,
+                matches=[(match, posting)],
+                channel="email",
+                send=SendOutcome(success=True, provider="resend"),
+            )
+        ]
+    )
+
+    async with db() as session:
+        refreshed = (await session.execute(select(MatchRow).where(MatchRow.id == match.id))).scalar_one()
+        assert set(refreshed.notified_channels) == {"sms", "email"}

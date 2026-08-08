@@ -40,3 +40,79 @@ ashby:
   - openai
   - mercury
   - deel
+
+# Workday career sites need a host + tenant + site tuple rather than one slug.
+# Each entry below returned HTTP 200 with a well-formed `jobPostings` payload
+# when live-verified on 2026-08-08. Workday enforces 20 results/page; max_pages
+# intentionally caps each board to its newest 200 roles per 15-minute sweep.
+workday:
+  - company: P&G
+    host: pg.wd5.myworkdayjobs.com
+    tenant: pg
+    site: "1000"
+    max_pages: 10
+  - company: Target
+    host: target.wd5.myworkdayjobs.com
+    tenant: target
+    site: targetcareers
+    max_pages: 10
+  - company: Capital One
+    host: capitalone.wd12.myworkdayjobs.com
+    tenant: capitalone
+    site: Capital_One
+    max_pages: 10
+  - company: Citi
+    host: citi.wd5.myworkdayjobs.com
+    tenant: citi
+    site: "2"
+    max_pages: 10
+  - company: Bain Capital
+    host: baincapital.wd1.myworkdayjobs.com
+    tenant: baincapital
+    site: External_Public
+    max_pages: 10
+  - company: Unilever
+    host: unilever.wd3.myworkdayjobs.com
+    tenant: unilever
+    site: Unilever_Experienced_Professionals
+    max_pages: 10
+  - company: BlackRock
+    host: blackrock.wd1.myworkdayjobs.com
+    tenant: blackrock
+    site: BlackRock_Professional
+    max_pages: 10
+  - company: Visa
+    host: visa.wd5.myworkdayjobs.com
+    tenant: visa
+    site: Visa
+    max_pages: 10
+  - company: Mastercard
+    host: mastercard.wd1.myworkdayjobs.com
+    tenant: mastercard
+    site: CorporateCareers
+    max_pages: 10
+  - company: Disney
+    host: disney.wd5.myworkdayjobs.com
+    tenant: disney
+    site: disneycareer
+    max_pages: 10
+  - company: Comcast
+    host: comcast.wd5.myworkdayjobs.com
+    tenant: comcast
+    site: Comcast_Careers
+    max_pages: 10
+  - company: RBC
+    host: rbc.wd3.myworkdayjobs.com
+    tenant: rbc
+    site: rbcglobal1
+    max_pages: 10
+  - company: Booz Allen Hamilton
+    host: bah.wd1.myworkdayjobs.com
+    tenant: bah
+    site: BAH_Jobs
+    max_pages: 10
+  - company: PwC
+    host: pwc.wd3.myworkdayjobs.com
+    tenant: pwc
+    site: Global_Campus_Careers
+    max_pages: 10
