@@ -26,10 +26,12 @@ Full design: `docs/superpowers/specs/2026-08-07-automated-swe-jobs-design.md`.
   skills, past titles, experience signal, inferred fields, education fields,
   and a short summary. Only that structured JSON is persisted; raw bytes and
   extracted text are never stored or logged. Re-upload replaces the result.
-- **Daily email:** `daily_email_cycle` sends completed profiles one email at
-  08:00 in the configured timezone. The legacy 08:00/20:00 SMS digest remains
-  separate. Delivery state is channel-aware, so delivery on one channel does
-  not suppress another.
+- **Daily email:** completed profiles receive one email at their chosen time
+  in the configured timezone. A settings page controls the per-user time and
+  pause state; successful-send dates prevent duplicates and the minute-level
+  due check catches up after restarts. The legacy 08:00/20:00 SMS digest
+  remains separate. Delivery state is channel-aware, so delivery on one
+  channel does not suppress another.
 - **Workday:** 14 live-verified Workday boards expand the curated source set
   across banking, investing, consulting, consumer goods, retail, payments,
   media, and generalist employers. Workday enforces 20 results per page, so
@@ -98,7 +100,7 @@ post-review hardening pass and a new company-watchlist feature.
   `fast_lane_cycle` (~2 min, reliable-tier + watchlist sources,
   change-detection first), `slow_lane_cycle` (~15 min, full sweep +
   staleness marking, the correctness backstop), the legacy `digest_cycle`
-  (SMS at 8am/8pm), and `daily_email_cycle` (email at 8am) — all delivery is
+  (SMS at 8am/8pm), and `daily_email_cycle` (per-user email time) — all delivery is
   decoupled from scrape cadence.
 - **DB** (`app/db/`): `users`, `criteria`, `postings`, `matches`, `messages`,
   `watchlist` via SQLAlchemy async + `create_all` (no Alembic, matching

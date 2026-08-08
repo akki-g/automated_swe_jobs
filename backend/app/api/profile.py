@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, time
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException
@@ -13,6 +13,16 @@ from app.db.models import Criteria, User
 from app.domain.models import RoleType, TargetField
 
 router = APIRouter(prefix="/api/profile", tags=["profile"])
+
+
+def _normalize_digest_time(value: str) -> str:
+    try:
+        parsed = time.fromisoformat(value)
+    except ValueError as exc:
+        raise ValueError("Email delivery time must use HH:MM format") from exc
+    if parsed.second or parsed.microsecond:
+        raise ValueError("Email delivery time must use HH:MM format")
+    return parsed.strftime("%H:%M")
 
 
 def _clean_list(values: list[str], *, max_items: int, max_length: int) -> list[str]:
@@ -36,7 +46,13 @@ class ProfileUpdate(BaseModel):
     sponsorship_required: bool | None = None
     freeform_notes: str = Field(default="", max_length=2000)
     email_digest_enabled: bool = True
+    email_digest_time: str = "08:00"
     mark_complete: bool = False
+
+    @field_validator("email_digest_time")
+    @classmethod
+    def validate_email_digest_time(cls, value: str) -> str:
+        return _normalize_digest_time(value)
 
     @field_validator("keywords")
     @classmethod
@@ -61,7 +77,18 @@ class ProfileResponse(BaseModel):
     resume_profile: dict
     resume_updated_at: datetime | None
     email_digest_enabled: bool
+    email_digest_time: str
     profile_completed: bool
+
+
+class EmailSettingsUpdate(BaseModel):
+    email_digest_enabled: bool
+    email_digest_time: str
+
+    @field_validator("email_digest_time")
+    @classmethod
+    def validate_email_digest_time(cls, value: str) -> str:
+        return _normalize_digest_time(value)
 
 
 def _response(user: User, criteria: Criteria) -> ProfileResponse:
@@ -77,6 +104,7 @@ def _response(user: User, criteria: Criteria) -> ProfileResponse:
         resume_profile=criteria.resume_profile or {},
         resume_updated_at=criteria.resume_updated_at,
         email_digest_enabled=user.email_digest_enabled,
+        email_digest_time=user.email_digest_time,
         profile_completed=user.profile_completed_at is not None,
     )
 
@@ -116,6 +144,7 @@ async def update_profile(
     now = datetime.now(UTC)
     user.name = body.name.strip()
     user.email_digest_enabled = body.email_digest_enabled
+    user.email_digest_time = body.email_digest_time
     if body.mark_complete:
         user.profile_completed_at = user.profile_completed_at or now
     criteria.role_types = [value.value for value in body.role_types]
@@ -125,5 +154,18 @@ async def update_profile(
     criteria.sponsorship_required = body.sponsorship_required
     criteria.freeform_notes = body.freeform_notes.strip()
     criteria.updated_at = now
+    await session.commit()
+    return _response(user, criteria)
+
+
+@router.put("/settings", response_model=ProfileResponse, dependencies=[Depends(require_csrf)])
+async def update_email_settings(
+    body: EmailSettingsUpdate,
+    user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+) -> ProfileResponse:
+    criteria = await _get_criteria(session, user.id)
+    user.email_digest_enabled = body.email_digest_enabled
+    user.email_digest_time = body.email_digest_time
     await session.commit()
     return _response(user, criteria)

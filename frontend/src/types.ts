@@ -18,6 +18,7 @@ export interface User {
   phone: string | null;
   profile_completed: boolean;
   email_digest_enabled: boolean;
+  email_digest_time: string;
 }
 
 export interface ResumeProfile {
@@ -42,5 +43,6 @@ export interface Profile {
   resume_profile: ResumeProfile;
   resume_updated_at: string | null;
   email_digest_enabled: boolean;
+  email_digest_time: string;
   profile_completed: boolean;
 }

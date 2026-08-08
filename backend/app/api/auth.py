@@ -20,6 +20,7 @@ from app.auth.security import (
     set_auth_cookies,
     verify_password,
 )
+from app.config import settings
 from app.db.models import Criteria, User
 
 router = APIRouter(prefix="/api/auth", tags=["auth"])
@@ -48,6 +49,7 @@ class UserResponse(BaseModel):
     phone: str | None
     profile_completed: bool
     email_digest_enabled: bool
+    email_digest_time: str
 
 
 def _user_response(user: User) -> UserResponse:
@@ -58,6 +60,7 @@ def _user_response(user: User) -> UserResponse:
         phone=user.phone if user.phone and _PHONE_PATTERN.fullmatch(user.phone) else None,
         profile_completed=user.profile_completed_at is not None,
         email_digest_enabled=user.email_digest_enabled,
+        email_digest_time=user.email_digest_time,
     )
 
 
@@ -84,6 +87,7 @@ async def signup(
         consent_method="web-signup-terms-v1",
         profile_completed_at=None,
         email_digest_enabled=True,
+        email_digest_time=f"{settings.daily_email_hour:02d}:00",
         created_at=now,
     )
     session.add(user)

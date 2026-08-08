@@ -78,6 +78,7 @@ async def test_signup_records_consent_and_profile_flow(web_app):
         )
         assert response.status_code == 201
         assert response.json()["phone"] is None
+        assert response.json()["email_digest_time"] == "08:00"
         assert "jobs_session" in client.cookies
 
         profile = await client.put(
@@ -107,6 +108,41 @@ async def test_signup_records_consent_and_profile_flow(web_app):
         assert user.consent_method == "web-signup-terms-v1"
         assert user.consent_at is not None
         assert criteria.target_fields == ["consulting", "finance_investment_banking"]
+
+
+@pytest.mark.asyncio
+async def test_email_settings_update_delivery_time(web_app):
+    app, session_factory = web_app
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await client.post(
+            "/api/auth/signup",
+            json={
+                "name": "Alex",
+                "email": "alex@example.com",
+                "password": "a-long-password",
+                "consent": True,
+            },
+        )
+        response = await client.put(
+            "/api/profile/settings",
+            headers=_csrf(client),
+            json={"email_digest_enabled": True, "email_digest_time": "17:45"},
+        )
+        invalid = await client.put(
+            "/api/profile/settings",
+            headers=_csrf(client),
+            json={"email_digest_enabled": True, "email_digest_time": "25:00"},
+        )
+
+        assert response.status_code == 200
+        assert response.json()["email_digest_time"] == "17:45"
+        assert invalid.status_code == 422
+
+    async with session_factory() as session:
+        user = (await session.execute(select(User))).scalar_one()
+        assert user.email_digest_time == "17:45"
 
 
 @pytest.mark.asyncio

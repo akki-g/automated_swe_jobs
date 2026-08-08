@@ -40,6 +40,8 @@ def _ensure_web_profile_columns(connection) -> None:
         "password_hash": "VARCHAR(255)",
         "profile_completed_at": "TIMESTAMP",
         "email_digest_enabled": "BOOLEAN NOT NULL DEFAULT true",
+        "email_digest_time": "VARCHAR(5) NOT NULL DEFAULT '08:00'",
+        "last_email_digest_sent_on": "DATE",
     }
     for name, definition in user_additions.items():
         if name not in user_columns:

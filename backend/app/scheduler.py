@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from datetime import UTC, datetime
+from datetime import UTC, date, datetime
+from zoneinfo import ZoneInfo
 
 from apscheduler.schedulers.asyncio import AsyncIOScheduler
 from apscheduler.triggers.cron import CronTrigger
@@ -11,6 +12,7 @@ from sqlalchemy import select
 from app.config import settings
 from app.db.models import Match as MatchRow
 from app.db.models import Message as MessageRow
+from app.db.models import User
 from app.db.session import session_scope
 from app.matching.rank import AnthropicMessagesClient
 from app.notify.dispatch import (
@@ -168,7 +170,9 @@ async def _record_digest_outcomes(outcomes: list[DigestOutcome]) -> None:
         await session.commit()
 
 
-async def _record_channel_digest_outcomes(outcomes: list[ChannelDigestOutcome]) -> None:
+async def _record_channel_digest_outcomes(
+    outcomes: list[ChannelDigestOutcome], *, email_digest_sent_on: date | None = None
+) -> None:
     if not outcomes:
         return
     now = datetime.now(UTC)
@@ -194,6 +198,10 @@ async def _record_channel_digest_outcomes(outcomes: list[ChannelDigestOutcome]) 
                     [match_row.id for match_row, _posting_row in outcome.matches],
                     [outcome.channel],
                 )
+                if outcome.channel == "email" and email_digest_sent_on is not None:
+                    user = await session.get(User, outcome.user.id)
+                    if user is not None:
+                        user.last_email_digest_sent_on = email_digest_sent_on
             else:
                 logger.warning(
                     "%s digest delivery failed for user_id=%s: %s",
@@ -292,16 +300,26 @@ async def digest_cycle() -> list[ChannelDigestOutcome]:
     return outcomes
 
 
-async def daily_email_cycle() -> list[ChannelDigestOutcome]:
+async def daily_email_cycle(now: datetime | None = None) -> list[ChannelDigestOutcome]:
     """Send each completed web profile one email containing matches not yet
     delivered by email. Matching cadence stays owned by the fast/slow lanes."""
     email_provider = ResendEmailProvider()
+    local_now = now or datetime.now(ZoneInfo(settings.scheduler_timezone))
+    due_time = local_now.strftime("%H:%M")
+    digest_date = local_now.date()
     async with session_scope() as session:
-        digest_items = await gather_pending_digests(session, channel="email")
+        digest_items = await gather_pending_digests(
+            session,
+            channel="email",
+            email_due_time=due_time,
+            email_digest_date=digest_date,
+        )
     if not digest_items:
         return []
     outcomes = await send_email_digests(digest_items, email_provider)
-    await _record_channel_digest_outcomes(outcomes)
+    await _record_channel_digest_outcomes(
+        outcomes, email_digest_sent_on=digest_date
+    )
     return outcomes
 
 
@@ -329,7 +347,7 @@ def build_scheduler() -> AsyncIOScheduler:
     )
     scheduler.add_job(
         daily_email_cycle,
-        CronTrigger(hour=settings.daily_email_hour, timezone=settings.scheduler_timezone),
+        CronTrigger(minute="*", timezone=settings.scheduler_timezone),
         id="daily_email_cycle",
         max_instances=1,
     )
