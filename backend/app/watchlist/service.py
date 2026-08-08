@@ -116,3 +116,24 @@ async def watchlisted_company_keys(session: AsyncSession, user_id: int) -> set[s
         )
     ).scalars().all()
     return set(rows)
+
+
+async def watchlisted_company_keys_by_user(
+    session: AsyncSession, user_ids: list[int]
+) -> dict[int, set[str]]:
+    """Batched form of watchlisted_company_keys() for every id in user_ids in
+    one query — used by the per-cycle match loop so it isn't issuing one
+    extra round-trip per active user per cycle (N+1)."""
+    if not user_ids:
+        return {}
+    rows = (
+        await session.execute(
+            select(WatchlistRow.user_id, WatchlistRow.company_key).where(
+                WatchlistRow.user_id.in_(user_ids), WatchlistRow.status == "active"
+            )
+        )
+    ).all()
+    by_user: dict[int, set[str]] = {user_id: set() for user_id in user_ids}
+    for user_id, company_key in rows:
+        by_user[user_id].add(company_key)
+    return by_user

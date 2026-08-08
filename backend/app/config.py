@@ -1,8 +1,20 @@
+from pathlib import Path
+
 from pydantic_settings import BaseSettings, SettingsConfigDict
+
+# The documented layout (README: `cp ../.env.example ../.env`) keeps .env at
+# the repo root, one level above backend/ — but the app is normally run with
+# backend/ as cwd (`cd backend && uv run ...`), and pydantic-settings' relative
+# env_file is resolved against cwd, not this file's location. Without an
+# explicit path, that mismatch meant .env was silently never read (empty
+# defaults, no error) unless a caller happened to run from the repo root.
+# Listing both paths lets either layout work; a repo-root .env still wins if
+# both existed, since later entries override earlier ones.
+_REPO_ROOT_ENV = Path(__file__).resolve().parents[2] / ".env"
 
 
 class Settings(BaseSettings):
-    model_config = SettingsConfigDict(env_file=".env", extra="ignore")
+    model_config = SettingsConfigDict(env_file=(".env", _REPO_ROOT_ENV), extra="ignore")
 
     database_url: str = "sqlite+aiosqlite:///./dev.db"
 
@@ -17,8 +29,8 @@ class Settings(BaseSettings):
     telnyx_api_key: str = ""
     telnyx_from_number: str = ""
 
-    gmail_address: str = ""
-    gmail_app_password: str = ""
+    resend_api_key: str = ""
+    resend_from_email: str = ""
 
     fast_lane_interval_minutes: int = 2
     slow_lane_interval_minutes: int = 15

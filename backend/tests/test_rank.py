@@ -1,9 +1,10 @@
+import json
 from datetime import UTC, datetime
 
 import pytest
 
 from app.domain.models import Criteria, Posting, Priority, RoleType
-from app.matching.rank import compute_priority, rank_postings
+from app.matching.rank import _RANK_BATCH_SIZE, compute_priority, rank_postings
 
 
 def _posting(**overrides) -> Posting:
@@ -38,6 +39,33 @@ class FakeAnthropicClient:
 class FailingAnthropicClient:
     async def create_message(self, *, system, messages, tools):
         raise RuntimeError("boom")
+
+
+class ChunkCountingClient:
+    """Returns a full score/blurb for every posting_key actually sent in
+    each call, and records how many postings were in each call — lets tests
+    assert on chunk boundaries without depending on _RANK_BATCH_SIZE's exact
+    value."""
+
+    def __init__(self) -> None:
+        self.batch_sizes: list[int] = []
+
+    async def create_message(self, *, system, messages, tools):
+        payload = json.loads(messages[0]["content"].split("Candidate postings: ", 1)[1].split("\n\n")[0])
+        self.batch_sizes.append(len(payload))
+        results = [{"posting_key": p["posting_key"], "score": 0.5, "blurb": "ok"} for p in payload]
+        return {"content": [{"type": "tool_use", "name": tools[0]["name"], "input": {"results": results}}]}
+
+
+class TruncatedAnthropicClient:
+    """Simulates a response cut off by max_tokens mid-array: a well-formed
+    tool_use block with fewer (here, zero) results than postings sent."""
+
+    async def create_message(self, *, system, messages, tools):
+        return {
+            "stop_reason": "max_tokens",
+            "content": [{"type": "tool_use", "name": tools[0]["name"], "input": {"results": []}}],
+        }
 
 
 @pytest.mark.asyncio
@@ -89,6 +117,41 @@ async def test_rank_postings_returns_empty_on_llm_failure():
     results = await rank_postings(postings, criteria, FailingAnthropicClient())
 
     assert results == []
+
+
+@pytest.mark.asyncio
+async def test_rank_postings_chunks_large_batches():
+    """Regression for the silent-truncation bug: a survivor set larger than
+    _RANK_BATCH_SIZE must be split across multiple calls, each within the
+    cap, rather than sent as one oversized call that risks stop_reason ==
+    'max_tokens' truncating the whole batch to zero results (see
+    test_rank_postings_reports_but_does_not_crash_on_truncated_response for
+    the truncation-visibility half of this fix)."""
+    postings = [_posting(posting_key=f"k{i}") for i in range(_RANK_BATCH_SIZE + 5)]
+    client = ChunkCountingClient()
+    criteria = Criteria(user_id=1)
+
+    results = await rank_postings(postings, criteria, client)
+
+    assert len(results) == len(postings)
+    assert all(size <= _RANK_BATCH_SIZE for size in client.batch_sizes)
+    assert sum(client.batch_sizes) == len(postings)
+    assert len(client.batch_sizes) > 1  # actually split into more than one call
+
+
+@pytest.mark.asyncio
+async def test_rank_postings_reports_but_does_not_crash_on_truncated_response(caplog):
+    """A response truncated by max_tokens must not silently look identical
+    to 'nothing scored above zero' — it should be logged so an operator can
+    tell the difference from a genuinely empty result."""
+    postings = [_posting(posting_key="k1")]
+    criteria = Criteria(user_id=1)
+
+    with caplog.at_level("WARNING"):
+        results = await rank_postings(postings, criteria, TruncatedAnthropicClient())
+
+    assert results == []
+    assert any("truncated" in record.message for record in caplog.records)
 
 
 def test_compute_priority_high_above_threshold():

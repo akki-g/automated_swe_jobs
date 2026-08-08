@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 from app.config import settings
 from app.db.models import Match, Posting, User
-from app.notify.email_gmail import GmailEmailProvider
+from app.notify.email_resend import ResendEmailProvider
 from app.notify.sms.base import SmsProvider
 
 _SEND_CONCURRENCY = asyncio.Semaphore(10)
@@ -41,7 +41,7 @@ class DigestOutcome:
     @property
     def delivered(self) -> bool:
         """A digest counts as delivered if *either* channel got through —
-        an expired Gmail app password shouldn't permanently block SMS
+        an expired Resend API key shouldn't permanently block SMS
         delivery, and vice versa."""
         return self.sms.success or bool(self.email and self.email.success)
 
@@ -66,7 +66,7 @@ async def send_digest(
     user: User,
     matches: list[tuple[Match, Posting]],
     sms_provider: SmsProvider,
-    email_provider: GmailEmailProvider,
+    email_provider: ResendEmailProvider,
 ) -> DigestOutcome:
     """Send one digest (SMS + email) to a single user, respecting opt-out."""
     if user.opted_out or not matches:
@@ -85,11 +85,11 @@ async def send_digest(
     async def _send_email() -> None:
         nonlocal email_result
         if not user.email:
-            email_result = SendOutcome(success=False, provider="gmail", skipped=True)
+            email_result = SendOutcome(success=False, provider="resend", skipped=True)
             return
         async with _SEND_CONCURRENCY:
             success = await email_provider.send(user.email, "New job matches", _format_email_digest(matches))
-        email_result = SendOutcome(success=success, provider="gmail", error=None if success else "send_failed")
+        email_result = SendOutcome(success=success, provider="resend", error=None if success else "send_failed")
 
     await asyncio.gather(_send_sms(), _send_email())
     assert sms_result is not None  # noqa: S101 - always set by _send_sms
@@ -127,7 +127,7 @@ async def send_instants(
 async def send_digests(
     items: list[DigestItem],
     sms_provider: SmsProvider,
-    email_provider: GmailEmailProvider,
+    email_provider: ResendEmailProvider,
 ) -> list[DigestOutcome]:
     """Fan out digests to many users concurrently, bounded by _SEND_CONCURRENCY
     (see spec: Notifications — Dispatch concurrency)."""

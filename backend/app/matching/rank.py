@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from dataclasses import dataclass
@@ -9,6 +10,23 @@ from app.config import settings
 from app.domain.models import Criteria, Posting, Priority
 
 logger = logging.getLogger(__name__)
+
+# Max postings scored in a single Claude call. A batch this size keeps the
+# expected output (one score+blurb per posting) comfortably under max_tokens
+# even for a user with a large survivor set in one cycle — without a cap, a
+# big-enough batch (observed: 89 postings against a fresh/broad criteria
+# backfill) hits stop_reason="max_tokens" mid-response and yields *zero*
+# results for the whole batch, silently, since a truncated-but-parseable
+# tool call looks like a normal "the model just didn't return anything"
+# response rather than an error (see _rank_batch's truncation check for the
+# other half of this fix: making that case loud instead of silent).
+_RANK_BATCH_SIZE = 20
+
+# Bounds how many chunk-scoring calls run at once, independent of the
+# per-user concurrency bound in pipeline.py's _RANK_CONCURRENCY — a single
+# user with a very large survivor set now fans out into multiple chunk
+# calls, and this keeps that fan-out from itself becoming unbounded.
+_CHUNK_CONCURRENCY = asyncio.Semaphore(5)
 
 RANK_TOOL = {
     "name": "rank_postings",
@@ -114,17 +132,15 @@ def _build_prompt(postings: list[Posting], criteria: Criteria) -> tuple[str, lis
     return system, [{"role": "user", "content": user_message}]
 
 
-async def rank_postings(
+async def _rank_batch(
     postings: list[Posting], criteria: Criteria, client: AnthropicClient
 ) -> list[RankResult]:
-    """Batch-score postings for one user's criteria in a single Claude call
-    (see spec: Matching — slow lane batches per user)."""
-    if not postings:
-        return []
-
+    """Score one chunk (<= _RANK_BATCH_SIZE postings) in a single Claude
+    call."""
     system, messages = _build_prompt(postings, criteria)
     try:
-        response = await client.create_message(system=system, messages=messages, tools=[RANK_TOOL])
+        async with _CHUNK_CONCURRENCY:
+            response = await client.create_message(system=system, messages=messages, tools=[RANK_TOOL])
         tool_input = _extract_tool_input(response, RANK_TOOL["name"])
     except Exception:  # noqa: BLE001 - a ranking failure must not crash the cycle
         logger.warning("rank_postings: LLM call failed for user_id=%s", criteria.user_id, exc_info=True)
@@ -141,7 +157,37 @@ async def rank_postings(
         except (KeyError, TypeError, ValueError):
             continue
         results.append(RankResult(posting_key=key, score=score, blurb=str(item.get("blurb", ""))[:300]))
+
+    # A response can be well-formed JSON so far as _extract_tool_input is
+    # concerned and still be truncated mid-array by the token limit — that
+    # shows up as stop_reason="max_tokens" with fewer (sometimes zero)
+    # results than postings sent in, and nothing above would otherwise catch
+    # it. Surface it loudly: a silently-truncated batch previously looked
+    # identical to "the model scored everything below the threshold."
+    if response.get("stop_reason") == "max_tokens":
+        logger.warning(
+            "rank_postings: response truncated by max_tokens for user_id=%s "
+            "(%d postings sent, %d results parsed) — consider lowering _RANK_BATCH_SIZE",
+            criteria.user_id,
+            len(postings),
+            len(results),
+        )
     return results
+
+
+async def rank_postings(
+    postings: list[Posting], criteria: Criteria, client: AnthropicClient
+) -> list[RankResult]:
+    """Batch-score postings for one user's criteria (see spec: Matching —
+    slow lane batches per user). Chunked into groups of at most
+    _RANK_BATCH_SIZE so a large survivor set can't silently truncate a single
+    huge call (see _RANK_BATCH_SIZE); chunks are scored concurrently."""
+    if not postings:
+        return []
+
+    chunks = [postings[i : i + _RANK_BATCH_SIZE] for i in range(0, len(postings), _RANK_BATCH_SIZE)]
+    chunk_results = await asyncio.gather(*(_rank_batch(chunk, criteria, client) for chunk in chunks))
+    return [result for results in chunk_results for result in results]
 
 
 def compute_priority(score: float) -> Priority:

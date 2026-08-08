@@ -35,7 +35,7 @@ post-review hardening pass and a new company-watchlist feature.
   `pipeline.match_new_postings` can independently force a match to
   high-priority (see "Company watchlist" below).
 - **Notify** (`app/notify/`): `SignalWireSmsProvider` (with Twilio-compatible
-  webhook signature verification), `GmailEmailProvider`, and `dispatch.py`
+  webhook signature verification), `ResendEmailProvider`, and `dispatch.py`
   (instant sends + capped/uncapped digest formatting, bounded concurrency).
   Every send returns a real success/failure outcome; the scheduler only
   marks a match `notified` — and only logs a `messages` row — for sends that
@@ -71,6 +71,65 @@ post-review hardening pass and a new company-watchlist feature.
   batch, not just the new-row insert) against the post-race DB state rather
   than crashing the cycle.
 
+## Performance fixes (post-MVP hardening pass)
+
+A follow-up review focused specifically on latency and scalability — the
+things that erode "fast and personalized" as postings and users accumulate,
+as opposed to the correctness gaps in the section below:
+
+- **Sources were fetched sequentially**, in both `pipeline.run_sources`
+  (slow lane's full sweep) and the fast lane's `check_for_changes()` poll —
+  contradicting the spec's "sources run concurrently each cycle." Each
+  source is independent I/O against a different host, so there was no
+  correctness reason for it. Fixed via `asyncio.gather` in both places; a
+  cycle now takes roughly the slowest single source's latency instead of the
+  sum of all of them.
+- **`store_new_postings` loaded the entire `postings` table every cycle**
+  just to check which posting_keys already existed — an unscoped
+  `SELECT * FROM postings` on every ~2 min fast-lane and ~15 min slow-lane
+  tick, against a table that only grows (9,810+ rows in one live run
+  already). Fixed by scoping the existence check to the batch's own
+  posting_keys (`WHERE posting_key IN (...)`, index-backed).
+- **Per-user Claude ranking calls ran one at a time**, and the fast lane
+  fell back to the same per-user batching as the slow lane instead of the
+  spec's per-posting-across-users batching for that lane. A cycle with N
+  active users took N sequential round-trips to Claude before any instant
+  SMS could go out — directly working against the fast lane's ~2 min
+  latency budget. Fixed by rule-filtering all users first (cheap, no I/O),
+  then firing the resulting per-user ranking calls concurrently
+  (`asyncio.gather`, bounded by a `Semaphore(5)` so a cycle with many active
+  users doesn't fire dozens of simultaneous requests at the Anthropic API).
+- **`watchlisted_company_keys` was queried once per user inside the match
+  loop** (N+1) instead of once for every candidate user up front. Fixed via
+  `watchlisted_company_keys_by_user`.
+- **A large survivor batch could silently truncate ranking to zero results.**
+  `rank_postings` sent every one of a user's rule-filter survivors to Claude
+  in a single call with `max_tokens=2048`; a big-enough batch (found live:
+  89 postings against a broad demo criteria set) hit `stop_reason ==
+  "max_tokens"` mid-array, which parsed as a well-formed but empty
+  `results` list — indistinguishable from "the model scored everything as a
+  poor fit." Fixed by chunking into groups of `_RANK_BATCH_SIZE` (20)
+  postings per call (scored concurrently, bounded), plus a warning log if a
+  chunk itself still gets truncated so this failure mode is never silent
+  again. Confirmed against the real bug: the same 89-posting batch that
+  previously produced 0 matches now correctly produces real scores for all
+  89 (15 of which cleared the instant-priority threshold) against the real
+  Anthropic API. See `tests/test_rank.py::test_rank_postings_chunks_large_batches`
+  and `::test_rank_postings_reports_but_does_not_crash_on_truncated_response`.
+- **`.env` at the repo root was never actually read.** `Settings` resolved
+  `env_file=".env"` relative to the process's current working directory;
+  since the app is normally run with `backend/` as cwd (`cd backend && uv
+  run ...`) but `.env` lives at the repo root per this README's own
+  Quick-start instructions, every value in it was silently ignored (empty
+  defaults, no error — `check_keys.py` reported real keys as `MISSING`).
+  Fixed by having `Settings` check both `backend/.env` and the repo-root
+  `.env`.
+- **Email provider switched from Gmail SMTP to Resend** (`app/notify/email_resend.py`)
+  — a plain `httpx` call against Resend's HTTP API, matching how every other
+  outbound integration in this repo (ATS sources, SignalWire) talks to its
+  provider, rather than pulling in the `resend` SDK for one call site. See
+  `RESEND_API_KEY`/`RESEND_FROM_EMAIL` in `.env.example`.
+
 ## Bug fixes from the pre-implementation review
 
 A code review before this pass identified several correctness gaps against
@@ -82,7 +141,7 @@ the spec's stated guarantees; all are fixed and covered by regression tests
   lane was doing a full fetch every ~2 min instead of a cheap check. Fixed
   via `app/sources/registry.py`; see `tests/test_source_registry.py`.
 - **Notification sends were never checked before marking a match
-  `notified`** — a failed SignalWire/Gmail send was silently and
+  `notified`** — a failed SignalWire/Resend send was silently and
   permanently lost (idempotency then blocked any retry) with no log trail.
   Fixed in `app/notify/dispatch.py`/`app/scheduler.py` (`SendOutcome`/
   `DigestOutcome`, conditional marking, per-send `messages` logging); see
@@ -132,7 +191,7 @@ the spec's stated guarantees; all are fixed and covered by regression tests
 
 ## What I could not live-test
 
-I don't have your SignalWire, Gmail, or Anthropic credentials in this
+I don't have your SignalWire, Resend, or Anthropic credentials in this
 environment (no `.env` exists yet). Everything downstream of those three
 integrations is covered by tests using fake/mocked clients instead of real
 API calls:
@@ -182,7 +241,7 @@ Requirements: Python 3.12+, [uv](https://docs.astral.sh/uv/).
 ```bash
 cd backend
 uv sync
-cp ../.env.example ../.env   # fill in SignalWire, Gmail, Anthropic creds
+cp ../.env.example ../.env   # fill in SignalWire, Resend, Anthropic creds
 uv run python scripts/seed_demo.py        # seeds one demo user + criteria
 uv run python scripts/run_scrape_once.py  # dry-run: scrape, rank, match, print — no sends
 ```

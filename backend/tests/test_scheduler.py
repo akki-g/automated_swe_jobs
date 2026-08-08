@@ -140,7 +140,7 @@ async def test_record_digest_outcomes_marks_notified_when_delivered(db):
         user=user,
         matches=[(match, posting)],
         sms=SendOutcome(success=True, provider="signalwire"),
-        email=SendOutcome(success=True, provider="gmail"),
+        email=SendOutcome(success=True, provider="resend"),
     )
 
     await _record_digest_outcomes([outcome])
@@ -160,7 +160,7 @@ async def test_record_digest_outcomes_leaves_unmarked_when_both_channels_fail(db
         user=user,
         matches=[(match, posting)],
         sms=SendOutcome(success=False, provider="signalwire", error="http_500"),
-        email=SendOutcome(success=False, provider="gmail", error="send_failed"),
+        email=SendOutcome(success=False, provider="resend", error="send_failed"),
     )
 
     await _record_digest_outcomes([outcome])
@@ -177,7 +177,7 @@ async def test_record_digest_outcomes_marks_notified_when_only_sms_delivers(db):
         user=user,
         matches=[(match, posting)],
         sms=SendOutcome(success=True, provider="signalwire"),
-        email=SendOutcome(success=False, provider="gmail", error="send_failed"),
+        email=SendOutcome(success=False, provider="resend", error="send_failed"),
     )
 
     await _record_digest_outcomes([outcome])

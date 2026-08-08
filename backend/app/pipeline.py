@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -21,7 +22,7 @@ from app.matching.filters import filter_postings
 from app.matching.rank import AnthropicClient, compute_priority, rank_postings
 from app.notify.dispatch import DigestItem
 from app.sources.base import Source
-from app.watchlist.service import watchlisted_company_keys
+from app.watchlist.service import watchlisted_company_keys_by_user
 
 logger = logging.getLogger(__name__)
 
@@ -32,16 +33,20 @@ class MatchCycleResult:
     digest_items: list[DigestItem]
 
 
+async def _fetch_source(source: Source) -> list:
+    try:
+        return await source.fetch()
+    except Exception:  # noqa: BLE001 - isolate one bad source from the rest
+        logger.warning("source %s failed", getattr(source, "name", source), exc_info=True)
+        return []
+
+
 async def run_sources(sources: list[Source]) -> list[Posting]:
-    """Fetch every source concurrently; a failing source contributes nothing
-    (see spec: Source isolation) rather than aborting the cycle."""
-    raw_batches = []
-    for source in sources:
-        try:
-            raw_batches.append(await source.fetch())
-        except Exception:  # noqa: BLE001 - isolate one bad source from the rest
-            logger.warning("source %s failed", getattr(source, "name", source), exc_info=True)
-            raw_batches.append([])
+    """Fetch every source concurrently (see spec: Source isolation — each
+    source is independent I/O against a different host, so there's no reason
+    to pay the sum of every source's latency instead of the max); a failing
+    source contributes nothing rather than aborting the cycle."""
+    raw_batches = await asyncio.gather(*(_fetch_source(source) for source in sources))
 
     normalized = [normalize(raw) for batch in raw_batches for raw in batch]
     return dedupe_postings(normalized)
@@ -70,8 +75,21 @@ async def _insert_and_touch(
     """Bump last_seen_at on already-known postings and insert rows for new
     ones. Shared by the first attempt and the post-rollback retry so the
     last_seen_at bump never gets silently dropped on a retry (see
-    store_new_postings)."""
-    existing = (await session.execute(select(PostingRow))).scalars().all()
+    store_new_postings).
+
+    Looks up existing rows by the *batch's own* posting_keys rather than
+    loading the whole postings table — the table only grows (9,810+ rows in
+    a single live run already, per README) and this runs on every fast-lane
+    (~2 min) and slow-lane (~15 min) tick, so an unscoped SELECT would get
+    slower every cycle for no benefit; a batch is at most one cycle's worth
+    of fetched postings, so the IN-list stays small and index-backed via the
+    unique posting_key index."""
+    batch_keys = [posting.posting_key for posting in postings]
+    existing = (
+        (await session.execute(select(PostingRow).where(PostingRow.posting_key.in_(batch_keys))))
+        .scalars()
+        .all()
+    )
     existing_by_key = {row.posting_key: row for row in existing}
 
     for posting in postings:
@@ -152,6 +170,26 @@ def _posting_row_to_domain(row: PostingRow) -> Posting:
     )
 
 
+# Bounds how many Claude ranking calls run at once across users in a single
+# match cycle. Ranking is per-user I/O with no shared mutable state, so it's
+# safe to run concurrently (see _rank_for_user); the semaphore just keeps a
+# cycle with many active users from firing dozens of simultaneous requests at
+# the Anthropic API, mirroring the bounded-concurrency pattern notify/dispatch.py
+# already uses for outbound sends.
+_RANK_CONCURRENCY = asyncio.Semaphore(5)
+
+
+async def _rank_for_user(
+    user: User, criteria: Criteria, survivors: list[Posting], rank_client: AnthropicClient
+) -> list:
+    try:
+        async with _RANK_CONCURRENCY:
+            return await rank_postings(survivors, criteria, rank_client)
+    except Exception:  # noqa: BLE001 - one user's bad state must not sink the whole cycle
+        logger.warning("match_new_postings: ranking failed for user_id=%s", user.id, exc_info=True)
+        return []
+
+
 async def match_new_postings(
     session: AsyncSession,
     new_postings: list[PostingRow],
@@ -160,7 +198,14 @@ async def match_new_postings(
 ) -> MatchCycleResult:
     """Rule-filter every new posting against every active user's criteria,
     then batch survivors to Claude for scoring/blurb (see spec: Matching).
-    Splits results into instant (high-priority) sends and digest items."""
+    Splits results into instant (high-priority) sends and digest items.
+
+    The rule-filter pass is pure/cheap and runs sequentially; the one
+    per-user Claude call this produces is real network I/O with no shared
+    state between users, so those calls run concurrently (bounded by
+    _RANK_CONCURRENCY) instead of one-at-a-time — a cycle with N active users
+    no longer takes N sequential round-trips to Claude, which matters most on
+    the fast lane's ~2 min budget."""
     if not new_postings:
         return MatchCycleResult(instant=[], digest_items=[])
 
@@ -182,6 +227,9 @@ async def match_new_postings(
     instant: list[tuple[User, MatchRow, PostingRow]] = []
     digest_items: list[DigestItem] = []
 
+    # Pass 1: rule-filter every user's criteria against this cycle's new
+    # postings (pure, no I/O) and note which users have any survivors.
+    candidates: list[tuple[User, Criteria, list[Posting]]] = []
     for user in users:
         try:
             criteria_row = user.criteria
@@ -191,59 +239,74 @@ async def match_new_postings(
             survivors = filter_postings(postings_domain, criteria)
             if not survivors:
                 continue
-
-            watched_keys = await watchlisted_company_keys(session, user.id)
-
-            rank_results = await rank_postings(survivors, criteria, rank_client)
-            rank_by_key = {r.posting_key: r for r in rank_results}
-
-            matches_for_digest: list[tuple[MatchRow, PostingRow]] = []
-            for posting in survivors:
-                rank_result = rank_by_key.get(posting.posting_key)
-                if rank_result is None:
-                    # No score for this posting this cycle — either the LLM
-                    # call failed (rank_postings already logged it) or the
-                    # model just didn't return a result for this key. Leave
-                    # it unmatched rather than writing a permanent
-                    # score=0/blurb="" placeholder: the unique
-                    # (user_id, posting_id) constraint on `matches` would
-                    # otherwise block ever retrying it (see spec: Data
-                    # flow — "A failed LLM call ... remain unmatched ... and
-                    # are naturally re-evaluated next cycle").
-                    continue
-
-                posting_row = postings_by_key[posting.posting_key]
-                priority = compute_priority(rank_result.score)
-                is_watched = normalize_company_key(posting.company) in watched_keys
-                if is_watched:
-                    # An explicit watchlist add is a stronger signal than the
-                    # score threshold — see spec addendum: watchlist priority.
-                    priority = Priority.HIGH
-
-                match_row = MatchRow(
-                    user_id=user.id,
-                    posting_id=posting_row.id,
-                    score=rank_result.score,
-                    blurb=rank_result.blurb,
-                    priority=priority.value,
-                    lane=lane,
-                    match_reason="watchlist" if is_watched else "new_posting",
-                    notified_channels=[],
-                    notified_at=None,
-                    created_at=now,
-                )
-                session.add(match_row)
-
-                if priority == Priority.HIGH:
-                    instant.append((user, match_row, posting_row))
-                else:
-                    matches_for_digest.append((match_row, posting_row))
-
-            if matches_for_digest:
-                digest_items.append(DigestItem(user=user, matches=matches_for_digest))
+            candidates.append((user, criteria, survivors))
         except Exception:  # noqa: BLE001 - one user's bad state must not sink the whole cycle
-            logger.warning("match_new_postings: failed for user_id=%s", user.id, exc_info=True)
+            logger.warning("match_new_postings: filtering failed for user_id=%s", user.id, exc_info=True)
             continue
+
+    if not candidates:
+        return MatchCycleResult(instant=[], digest_items=[])
+
+    # Pass 2: one watchlist query for every candidate user (instead of one
+    # per user in a loop) and one concurrent batch of Claude calls.
+    watched_by_user = await watchlisted_company_keys_by_user(
+        session, [user.id for user, _criteria, _survivors in candidates]
+    )
+    rank_results_by_user = await asyncio.gather(
+        *(_rank_for_user(user, criteria, survivors, rank_client) for user, criteria, survivors in candidates)
+    )
+
+    # Pass 3: turn each user's rank results into match rows against the
+    # shared session — cheap, in-memory, sequential (AsyncSession isn't
+    # safe to use concurrently).
+    for (user, _criteria, survivors), rank_results in zip(candidates, rank_results_by_user):
+        watched_keys = watched_by_user.get(user.id, set())
+        rank_by_key = {r.posting_key: r for r in rank_results}
+
+        matches_for_digest: list[tuple[MatchRow, PostingRow]] = []
+        for posting in survivors:
+            rank_result = rank_by_key.get(posting.posting_key)
+            if rank_result is None:
+                # No score for this posting this cycle — either the LLM
+                # call failed (rank_postings already logged it) or the
+                # model just didn't return a result for this key. Leave
+                # it unmatched rather than writing a permanent
+                # score=0/blurb="" placeholder: the unique
+                # (user_id, posting_id) constraint on `matches` would
+                # otherwise block ever retrying it (see spec: Data
+                # flow — "A failed LLM call ... remain unmatched ... and
+                # are naturally re-evaluated next cycle").
+                continue
+
+            posting_row = postings_by_key[posting.posting_key]
+            priority = compute_priority(rank_result.score)
+            is_watched = normalize_company_key(posting.company) in watched_keys
+            if is_watched:
+                # An explicit watchlist add is a stronger signal than the
+                # score threshold — see spec addendum: watchlist priority.
+                priority = Priority.HIGH
+
+            match_row = MatchRow(
+                user_id=user.id,
+                posting_id=posting_row.id,
+                score=rank_result.score,
+                blurb=rank_result.blurb,
+                priority=priority.value,
+                lane=lane,
+                match_reason="watchlist" if is_watched else "new_posting",
+                notified_channels=[],
+                notified_at=None,
+                created_at=now,
+            )
+            session.add(match_row)
+
+            if priority == Priority.HIGH:
+                instant.append((user, match_row, posting_row))
+            else:
+                matches_for_digest.append((match_row, posting_row))
+
+        if matches_for_digest:
+            digest_items.append(DigestItem(user=user, matches=matches_for_digest))
 
     await session.flush()
     return MatchCycleResult(instant=instant, digest_items=digest_items)

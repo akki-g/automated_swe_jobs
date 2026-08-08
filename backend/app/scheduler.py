@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import UTC, datetime
 
@@ -13,7 +14,7 @@ from app.db.models import Message as MessageRow
 from app.db.session import session_scope
 from app.matching.rank import AnthropicMessagesClient
 from app.notify.dispatch import DigestItem, DigestOutcome, SendOutcome, send_digests, send_instants
-from app.notify.email_gmail import GmailEmailProvider
+from app.notify.email_resend import ResendEmailProvider
 from app.notify.sms.signalwire import SignalWireSmsProvider
 from app.pipeline import (
     MatchCycleResult,
@@ -178,6 +179,16 @@ async def _process_new_postings(
     return result
 
 
+async def _check_for_changes(source: Source) -> bool:
+    try:
+        return await source.check_for_changes()
+    except NotImplementedError:
+        return False
+    except Exception:  # noqa: BLE001 - one source's check must not skip the rest
+        logger.warning("fast lane: check_for_changes failed for %s", source.name, exc_info=True)
+        return False
+
+
 async def fast_lane_cycle() -> MatchCycleResult:
     """Poll reliable-tier sources' cheap change signal; on a hit, fetch just
     that source and push high-priority matches out immediately. Best-effort
@@ -188,15 +199,13 @@ async def fast_lane_cycle() -> MatchCycleResult:
     async with session_scope() as session:
         sources = await reliable_tier_sources(session)
 
-    changed: list[Source] = []
-    for source in sources:
-        try:
-            if await source.check_for_changes():
-                changed.append(source)
-        except NotImplementedError:
-            continue
-        except Exception:  # noqa: BLE001 - one source's check must not skip the rest
-            logger.warning("fast lane: check_for_changes failed for %s", source.name, exc_info=True)
+    # Every source's check_for_changes() is an independent network round-trip
+    # (a HEAD/GET against that source's own URL) with no shared state, so
+    # checking them concurrently is what makes this lane worth calling
+    # "fast" — checking N sources one-at-a-time would make the fast lane's
+    # own polling latency scale with the size of companies.yaml.
+    changed_flags = await asyncio.gather(*(_check_for_changes(source) for source in sources))
+    changed = [source for source, has_changed in zip(sources, changed_flags) if has_changed]
 
     if not changed:
         return MatchCycleResult(instant=[], digest_items=[])
@@ -224,7 +233,7 @@ async def digest_cycle() -> list[DigestOutcome]:
     """Gather every un-sent normal-priority match (from either lane) and send
     one digest per user (see spec: Notifications, Data flow)."""
     sms_provider = SignalWireSmsProvider()
-    email_provider = GmailEmailProvider()
+    email_provider = ResendEmailProvider()
 
     async with session_scope() as session:
         digest_items = await gather_pending_digests(session)

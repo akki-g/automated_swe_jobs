@@ -8,8 +8,8 @@ CHECKS = {
     "SIGNALWIRE_PROJECT_ID": settings.signalwire_project_id,
     "SIGNALWIRE_API_TOKEN": settings.signalwire_api_token,
     "SIGNALWIRE_FROM_NUMBER": settings.signalwire_from_number,
-    "GMAIL_ADDRESS": settings.gmail_address,
-    "GMAIL_APP_PASSWORD": settings.gmail_app_password,
+    "RESEND_API_KEY": settings.resend_api_key,
+    "RESEND_FROM_EMAIL": settings.resend_from_email,
 }
 
 
