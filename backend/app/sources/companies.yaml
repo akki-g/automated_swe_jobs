@@ -1,0 +1,42 @@
+# Curated ATS company list — edited without a deploy (see spec: Sources —
+# Company-list maintenance). Slugs are each provider's board identifier, not
+# the company's display name; find them in the company's careers page URL.
+#
+# Every slug below was live-verified against the provider's real public API
+# during this build (a 200 response with a well-formed jobs payload) —
+# see the project's build notes for the verification run.
+greenhouse:
+  - stripe
+  - airbnb
+  - robinhood
+  - coinbase
+  - affirm
+  - asana
+  - dropbox
+  - cloudflare
+  - discord
+  - figma
+  - gitlab
+  - instacart
+  - lyft
+  - pinterest
+  - reddit
+  - squarespace
+  - databricks
+  - brex
+  - gusto
+  - mixpanel
+  - twitch
+  - samsara
+lever:
+  - plaid
+  - palantir
+ashby:
+  - notion
+  - linear
+  - ramp
+  - vanta
+  - watershed
+  - openai
+  - mercury
+  - deel

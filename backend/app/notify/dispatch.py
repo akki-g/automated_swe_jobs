@@ -1,0 +1,141 @@
+from __future__ import annotations
+
+import asyncio
+from dataclasses import dataclass
+
+from app.config import settings
+from app.db.models import Match, Posting, User
+from app.notify.email_gmail import GmailEmailProvider
+from app.notify.sms.base import SmsProvider
+
+_SEND_CONCURRENCY = asyncio.Semaphore(10)
+
+
+@dataclass
+class DigestItem:
+    user: User
+    matches: list[tuple[Match, Posting]]
+
+
+@dataclass(frozen=True)
+class SendOutcome:
+    """Whether a single send actually succeeded — callers must check this
+    before treating a match as delivered (see spec: Error handling
+    principles — 'All sends logged with delivery status'). `skipped` covers
+    opted-out users / no matches, which is neither a success nor a failure
+    worth retrying."""
+
+    success: bool
+    provider: str
+    error: str | None = None
+    skipped: bool = False
+
+
+@dataclass(frozen=True)
+class DigestOutcome:
+    user: User
+    matches: list[tuple[Match, Posting]]
+    sms: SendOutcome
+    email: SendOutcome | None
+
+    @property
+    def delivered(self) -> bool:
+        """A digest counts as delivered if *either* channel got through —
+        an expired Gmail app password shouldn't permanently block SMS
+        delivery, and vice versa."""
+        return self.sms.success or bool(self.email and self.email.success)
+
+
+def _format_sms_digest(items: list[tuple[Match, Posting]]) -> str:
+    cap = settings.digest_max_sms_matches
+    shown = items[:cap]
+    lines = [f"{posting.company}: {posting.title} — {posting.url}" for _, posting in shown]
+    text = "New matches:\n" + "\n".join(lines)
+    remaining = len(items) - len(shown)
+    if remaining > 0:
+        text += f"\n+{remaining} more — reply LIST for all"
+    return text
+
+
+def _format_email_digest(items: list[tuple[Match, Posting]]) -> str:
+    lines = [f"- {posting.company}: {posting.title}\n  {posting.url}" for _, posting in items]
+    return "New matches for you:\n\n" + "\n\n".join(lines)
+
+
+async def send_digest(
+    user: User,
+    matches: list[tuple[Match, Posting]],
+    sms_provider: SmsProvider,
+    email_provider: GmailEmailProvider,
+) -> DigestOutcome:
+    """Send one digest (SMS + email) to a single user, respecting opt-out."""
+    if user.opted_out or not matches:
+        skipped = SendOutcome(success=False, provider=sms_provider.name, skipped=True)
+        return DigestOutcome(user=user, matches=matches, sms=skipped, email=None)
+
+    sms_result: SendOutcome | None = None
+    email_result: SendOutcome | None = None
+
+    async def _send_sms() -> None:
+        nonlocal sms_result
+        async with _SEND_CONCURRENCY:
+            result = await sms_provider.send(user.phone, _format_sms_digest(matches))
+        sms_result = SendOutcome(success=result.success, provider=result.provider, error=result.error)
+
+    async def _send_email() -> None:
+        nonlocal email_result
+        if not user.email:
+            email_result = SendOutcome(success=False, provider="gmail", skipped=True)
+            return
+        async with _SEND_CONCURRENCY:
+            success = await email_provider.send(user.email, "New job matches", _format_email_digest(matches))
+        email_result = SendOutcome(success=success, provider="gmail", error=None if success else "send_failed")
+
+    await asyncio.gather(_send_sms(), _send_email())
+    assert sms_result is not None  # noqa: S101 - always set by _send_sms
+    return DigestOutcome(user=user, matches=matches, sms=sms_result, email=email_result)
+
+
+async def send_instant(
+    user: User,
+    match: Match,
+    posting: Posting,
+    sms_provider: SmsProvider,
+) -> SendOutcome:
+    """Send a single high-priority match immediately, bypassing the digest
+    queue (see spec: Notifications — hybrid delivery)."""
+    if user.opted_out:
+        return SendOutcome(success=False, provider=sms_provider.name, skipped=True)
+    body = f"High match: {posting.company}: {posting.title} — {posting.url}"
+    if match.blurb:
+        body += f"\n{match.blurb}"
+    async with _SEND_CONCURRENCY:
+        result = await sms_provider.send(user.phone, body)
+    return SendOutcome(success=result.success, provider=result.provider, error=result.error)
+
+
+async def send_instants(
+    items: list[tuple[User, Match, Posting]],
+    sms_provider: SmsProvider,
+) -> list[tuple[User, Match, Posting, SendOutcome]]:
+    outcomes = await asyncio.gather(
+        *(send_instant(user, match, posting, sms_provider) for user, match, posting in items)
+    )
+    return [(user, match, posting, outcome) for (user, match, posting), outcome in zip(items, outcomes)]
+
+
+async def send_digests(
+    items: list[DigestItem],
+    sms_provider: SmsProvider,
+    email_provider: GmailEmailProvider,
+) -> list[DigestOutcome]:
+    """Fan out digests to many users concurrently, bounded by _SEND_CONCURRENCY
+    (see spec: Notifications — Dispatch concurrency)."""
+    return list(
+        await asyncio.gather(
+            *(
+                send_digest(item.user, item.matches, sms_provider, email_provider)
+                for item in items
+            )
+        )
+    )
