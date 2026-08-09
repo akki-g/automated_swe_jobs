@@ -196,6 +196,7 @@ class ClaudeTailorClient:
                 }
             ],
             output_config=_output_config(PARSED_RESUME_SCHEMA),
+            timeout=75,
         )
         return _response_json(response)
 
@@ -237,6 +238,7 @@ class ClaudeTailorClient:
                         "max_content_tokens": 12_000,
                     },
                 ],
+                timeout=90,
             )
             return _response_text(response)
         except Exception:  # noqa: BLE001 - the supplied posting remains a valid fallback
@@ -295,6 +297,7 @@ class ClaudeTailorClient:
                 }
             ],
             output_config=_output_config(TAILORED_RESUME_SCHEMA),
+            timeout=90,
         )
         return _response_json(response)
 

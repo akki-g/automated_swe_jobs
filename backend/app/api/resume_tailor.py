@@ -34,6 +34,7 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/api/resume", tags=["resume"])
 
 MAX_POSTINGS_PER_REQUEST = 10
+TAILOR_REQUEST_TIMEOUT_SECONDS = 270
 
 # Each job in a tailoring request is an independent Claude call + LaTeX
 # compile with no shared state — safe to run concurrently. Bounded so a
@@ -164,28 +165,44 @@ async def tailor_resume(
     if not rows:
         raise HTTPException(status_code=404, detail="None of the selected postings were found")
 
-    # The cheap, lossless parsing pass is shared by every selected posting.
-    # Only the job-specific Sonnet research/rewrite work runs per posting.
     try:
-        parsed_resume = await parse_resume_structure(resume_text, client=client)
-    except Exception as exc:  # noqa: BLE001 - expose a stable API error, not provider internals
-        logger.warning("resume tailoring: structured resume parsing failed", exc_info=True)
-        raise HTTPException(status_code=502, detail="Could not understand the uploaded resume") from exc
+        async with asyncio.timeout(TAILOR_REQUEST_TIMEOUT_SECONDS):
+            # The cheap, lossless parsing pass is shared by every selected
+            # posting. Only the job-specific Sonnet research/rewrite work
+            # runs per posting.
+            try:
+                parsed_resume = await parse_resume_structure(resume_text, client=client)
+            except Exception as exc:  # noqa: BLE001 - hide provider internals
+                logger.warning("resume tailoring: structured resume parsing failed", exc_info=True)
+                raise HTTPException(
+                    status_code=502,
+                    detail="Could not understand the uploaded resume",
+                ) from exc
 
-    results = await asyncio.gather(
-        *(
-            _build_one(
-                parsed_resume,
-                user.name,
-                user.email,
-                user.phone,
-                match_row.id,
-                posting_row,
-                client,
+            results = await asyncio.gather(
+                *(
+                    _build_one(
+                        parsed_resume,
+                        user.name,
+                        user.email,
+                        user.phone,
+                        match_row.id,
+                        posting_row,
+                        client,
+                    )
+                    for match_row, posting_row in rows
+                )
             )
-            for match_row, posting_row in rows
+    except TimeoutError as exc:
+        logger.warning(
+            "resume tailoring: request exceeded %ss for %s posting(s)",
+            TAILOR_REQUEST_TIMEOUT_SECONDS,
+            len(rows),
         )
-    )
+        raise HTTPException(
+            status_code=504,
+            detail="Resume tailoring took too long. Select fewer jobs and try again.",
+        ) from exc
 
     if len(results) == 1:
         only = results[0]

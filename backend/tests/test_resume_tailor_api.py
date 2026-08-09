@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import io
 import json
 import zipfile
@@ -64,9 +65,12 @@ class FakeTailorClient:
         self.fail_for_company = fail_for_company
         self.calls: list[str] = []
         self.parse_calls = 0
+        self.parse_delay = 0.0
 
     async def parse_resume(self, resume_text: str):
         self.parse_calls += 1
+        if self.parse_delay:
+            await asyncio.sleep(self.parse_delay)
         return PARSED_RESUME
 
     async def rewrite_resume(
@@ -242,6 +246,37 @@ async def test_tailor_single_failing_job_returns_502(tailor_app):
         )
 
         assert response.status_code == 502
+
+
+@pytest.mark.asyncio
+async def test_tailor_returns_useful_error_before_proxy_deadline(tailor_app, monkeypatch):
+    from app.api import resume_tailor as resume_tailor_api
+
+    app, session_factory, fake_client = tailor_app
+    fake_client.parse_delay = 0.05
+    monkeypatch.setattr(resume_tailor_api, "TAILOR_REQUEST_TIMEOUT_SECONDS", 0.001)
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        match_ids = await _signup_and_seed_matches(client, session_factory, ["Acme"])
+
+        response = await client.post(
+            "/api/resume/tailor",
+            headers=_csrf(client),
+            files={
+                "file": (
+                    "resume.docx",
+                    _resume_bytes(),
+                    "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                )
+            },
+            data={"match_ids": [str(match_ids[0])]},
+        )
+
+    assert response.status_code == 504
+    assert response.json()["detail"] == (
+        "Resume tailoring took too long. Select fewer jobs and try again."
+    )
 
 
 @pytest.mark.asyncio
