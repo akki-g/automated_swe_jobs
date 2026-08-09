@@ -18,6 +18,7 @@ from app.auth.security import get_current_user, get_db_session, require_csrf
 from app.db.models import Match as MatchRow
 from app.db.models import Posting as PostingRow
 from app.db.models import User
+from app.ingest.normalize import extract_description
 from app.resume.compile_pdf import LatexCompileError, compile_latex_to_pdf
 from app.resume.latex_template import render_latex
 from app.resume.parse import MAX_RESUME_BYTES, ResumeParseError, extract_resume_text
@@ -63,6 +64,8 @@ def _safe_filename(company: str, title: str) -> str:
 async def _build_one(
     resume_text: str,
     contact_name: str,
+    contact_email: str | None,
+    contact_phone: str | None,
     match_id: int,
     posting_row: PostingRow,
     client: TailorClient,
@@ -74,9 +77,15 @@ async def _build_one(
                 company=posting_row.company,
                 title=posting_row.title,
                 location=posting_row.location,
+                description=extract_description(posting_row.raw),
                 client=client,
             )
-            tex = render_latex(content, contact_name=contact_name)
+            tex = render_latex(
+                content,
+                contact_name=contact_name,
+                contact_email=contact_email,
+                contact_phone=contact_phone,
+            )
             pdf_bytes = await compile_latex_to_pdf(tex)
         except LatexCompileError:
             logger.warning("resume tailoring: LaTeX compile failed for posting_id=%s", posting_row.id, exc_info=True)
@@ -151,7 +160,15 @@ async def tailor_resume(
 
     results = await asyncio.gather(
         *(
-            _build_one(resume_text, user.name, match_row.id, posting_row, client)
+            _build_one(
+                resume_text,
+                user.name,
+                user.email,
+                user.phone,
+                match_row.id,
+                posting_row,
+                client,
+            )
             for match_row, posting_row in rows
         )
     )

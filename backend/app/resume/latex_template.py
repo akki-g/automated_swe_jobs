@@ -17,6 +17,20 @@ _LATEX_SPECIAL_CHARS = {
     "}": r"\}",
     "~": r"\textasciitilde{}",
     "^": r"\textasciicircum{}",
+    # Normalize common Unicode punctuation explicitly. The Tectonic/XeTeX
+    # build paired with Helvetica's T1 encoding otherwise drops en dashes or
+    # renders middle dots as unrelated accented glyphs.
+    "–": "--",
+    "—": "---",
+    "−": "-",
+    "·": r"\textperiodcentered{}",
+    "•": r"\textbullet{}",
+    "‘": "`",
+    "’": "'",
+    "“": "``",
+    "”": "''",
+    "…": r"\ldots{}",
+    "\u00a0": "~",
 }
 
 
@@ -34,60 +48,96 @@ def _itemize(bullets: tuple[str, ...]) -> str:
     return f"\\begin{{itemize}}\n{items}\n\\end{{itemize}}"
 
 
-def render_latex(content: TailoredResumeContent, *, contact_name: str) -> str:
-    """Fill a fixed, pre-tested one-page LaTeX resume template via plain
-    string substitution into known-good slots — the model never generates
-    LaTeX directly (see spec: Resume tailoring), so a malformed brace or
-    stray backslash from the model can't reach the document structure."""
+def _separated_line(values: tuple[str, ...]) -> str:
+    """Escape values individually so the separator remains real LaTeX."""
+    return r" \enspace\textcolor{accent}{\textbullet}\enspace ".join(
+        escape_latex(value) for value in values if value
+    )
+
+
+def render_latex(
+    content: TailoredResumeContent,
+    *,
+    contact_name: str,
+    contact_email: str | None = None,
+    contact_phone: str | None = None,
+) -> str:
+    """Fill a compact, fixed one-page template with escaped structured data."""
     name = escape_latex(contact_name or "Candidate")
     summary = escape_latex(content.summary)
-    skills_line = escape_latex(" \\textbullet\\ ".join(content.skills)) if content.skills else ""
+    contact_line = _separated_line(tuple(value for value in (contact_email, contact_phone) if value))
+    skills_line = _separated_line(content.skills)
 
     experience_blocks = []
     for entry in content.experience:
-        dates = f" \\hfill {escape_latex(entry.dates)}" if entry.dates else ""
         experience_blocks.append(
-            "\\textbf{%s} --- %s%s\\\\\n%s"
+            "\\begin{tabularx}{\\textwidth}{@{}X r@{}}\n"
+            "  \\textbf{%s} & \\textbf{%s} \\\\\n"
+            "  \\textit{%s} &\n"
+            "\\end{tabularx}\n%s"
             % (
                 escape_latex(entry.title),
+                escape_latex(entry.dates),
                 escape_latex(entry.organization),
-                dates,
                 _itemize(entry.bullets),
             )
         )
-    experience_section = "\n\\vspace{4pt}\n".join(experience_blocks)
+    experience_section = "\n\\vspace{2.5pt}\n".join(experience_blocks)
 
     education_lines = []
     for entry in content.education:
-        detail = f" --- {escape_latex(entry.detail)}" if entry.detail else ""
-        education_lines.append(f"{escape_latex(entry.school)}{detail}\\\\")
+        detail = f" \\enspace {escape_latex(entry.detail)}" if entry.detail else ""
+        education_lines.append(f"\\textbf{{{escape_latex(entry.school)}}}{detail}\\\\[1pt]")
     education_section = "\n".join(education_lines)
 
-    return r"""\documentclass[11pt]{article}
-\usepackage[margin=0.75in]{geometry}
+    template = r"""\documentclass[10pt,letterpaper]{article}
+\usepackage[letterpaper,top=0.42in,bottom=0.42in,left=0.55in,right=0.55in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage{helvet}
+\usepackage{tabularx}
 \usepackage{enumitem}
-\setlist[itemize]{leftmargin=1.2em, itemsep=1pt, topsep=2pt}
+\usepackage{xcolor}
+\definecolor{accent}{HTML}{243B53}
+\renewcommand{\familydefault}{\sfdefault}
+\setlength{\parindent}{0pt}
+\setlength{\parskip}{0pt}
+\setlength{\tabcolsep}{0pt}
+\setlist[itemize]{leftmargin=1.25em, label=\textbullet, itemsep=0.5pt, parsep=0pt, topsep=1pt, partopsep=0pt}
+\newcommand{\ressection}[1]{%
+  \vspace{5pt}%
+  {\color{accent}\large\bfseries #1}\par\vspace{1.5pt}%
+  {\color{accent}\hrule height 0.7pt}\vspace{3pt}%
+}
 \pagestyle{empty}
+\raggedright
 \begin{document}
+\small
 \begin{center}
-{\LARGE \textbf{%s}}
+{\fontsize{18}{20}\selectfont\bfseries\color{accent} __NAME__}\par
+\vspace{2pt}
+__CONTACT__
 \end{center}
-\vspace{6pt}
+\vspace{-2pt}
 
-\textbf{\large Summary}\\
-%s
+\ressection{SUMMARY}
+__SUMMARY__
 
-\vspace{8pt}
-\textbf{\large Skills}\\
-%s
+\ressection{SKILLS}
+__SKILLS__
 
-\vspace{8pt}
-\textbf{\large Experience}\\
-%s
+\ressection{EXPERIENCE}
+__EXPERIENCE__
 
-\vspace{8pt}
-\textbf{\large Education}\\
-%s
+\ressection{EDUCATION}
+__EDUCATION__
 
 \end{document}
-""" % (name, summary, skills_line, experience_section, education_section)
+"""
+    return (
+        template.replace("__NAME__", name)
+        .replace("__CONTACT__", contact_line)
+        .replace("__SUMMARY__", summary)
+        .replace("__SKILLS__", skills_line)
+        .replace("__EXPERIENCE__", experience_section)
+        .replace("__EDUCATION__", education_section)
+    )

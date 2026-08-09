@@ -1,6 +1,9 @@
 from __future__ import annotations
 
+import io
+
 import pytest
+from pypdf import PdfReader
 
 from app.resume.compile_pdf import LatexCompileError, compile_latex_to_pdf
 from app.resume.latex_template import escape_latex, render_latex
@@ -18,9 +21,11 @@ class FakeTailorClient:
         self.tool_input = tool_input
         self.calls = 0
         self.last_message: str | None = None
+        self.last_system: str | None = None
 
     async def create_message(self, *, system, messages, tools):
         self.calls += 1
+        self.last_system = system
         self.last_message = messages[0]["content"]
         return {"content": [{"type": "tool_use", "name": tools[0]["name"], "input": self.tool_input}]}
 
@@ -65,6 +70,23 @@ async def test_tailor_resume_content_calls_client_with_resume_and_posting():
 
 
 @pytest.mark.asyncio
+async def test_tailor_resume_content_uses_job_description_and_rejects_meta_commentary():
+    client = FakeTailorClient(SAMPLE_PAYLOAD)
+
+    await tailor_resume_content(
+        "Python and SQL experience.",
+        company="Acme",
+        title="New Grad SWE",
+        location="Remote",
+        description="Build distributed Python services and data pipelines.",
+        client=client,
+    )
+
+    assert "Build distributed Python services" in client.last_message
+    assert "Never use meta-commentary" in client.last_system
+
+
+@pytest.mark.asyncio
 async def test_tailor_resume_content_propagates_client_failure():
     with pytest.raises(RuntimeError):
         await tailor_resume_content(
@@ -75,7 +97,7 @@ async def test_tailor_resume_content_propagates_client_failure():
 def test_normalize_tailored_content_bounds_and_dedupes_skills():
     result = normalize_tailored_content(SAMPLE_PAYLOAD)
 
-    assert result.skills == ("Python", "SQL", "x" * 60)
+    assert result.skills == ("Python", "SQL", "x" * 39 + "…")
     assert len(result.experience) == 1  # entry missing a title is dropped
     assert result.experience[0].title == "SWE Intern"
     assert result.education[0].school == "State University"
@@ -136,6 +158,19 @@ def test_render_latex_produces_compilable_document_with_special_characters():
     assert r"\#" in tex
 
 
+def test_render_latex_keeps_commands_for_skill_separators_and_normalizes_unicode():
+    tex = render_latex(
+        _content(skills=("Python", "Go")),
+        contact_name="Alex Morgan",
+        contact_email="alex@example.com",
+        contact_phone="555–0100",
+    )
+
+    assert r"Python \enspace\textcolor{accent}{\textbullet}\enspace Go" in tex
+    assert r"\textbackslash{}textbullet" not in tex
+    assert "555--0100" in tex
+
+
 @pytest.mark.asyncio
 async def test_compile_latex_to_pdf_produces_real_pdf_bytes():
     tex = render_latex(_content(), contact_name="Alex Morgan")
@@ -143,6 +178,45 @@ async def test_compile_latex_to_pdf_produces_real_pdf_bytes():
     pdf_bytes = await compile_latex_to_pdf(tex)
 
     assert pdf_bytes.startswith(b"%PDF-")
+
+
+@pytest.mark.asyncio
+async def test_bounded_full_resume_compiles_to_one_page():
+    bullet = (
+        "Designed reliable distributed services and machine-learning data pipelines, "
+        "improving production performance and operational visibility with measured impact."
+    )
+    content = _content(
+        summary=(
+            "Software engineer building reliable distributed systems and applied machine-learning "
+            "infrastructure. Experienced with backend services, data platforms, and CI/CD."
+        ),
+        skills=tuple(f"Relevant technical skill {index}" for index in range(16)),
+        experience=tuple(
+            ExperienceEntry(
+                title=f"Software Engineering Role {index}",
+                organization=f"Engineering and Research Organization {index}",
+                dates="Jan 2024–Present",
+                bullets=(bullet, bullet, bullet),
+            )
+            for index in range(4)
+        ),
+        education=(
+            EducationEntry("State University", "B.S. Computer Science · Expected 2027 · GPA 3.7"),
+            EducationEntry("Technical College", "Certificate in Data Systems"),
+        ),
+    )
+
+    pdf_bytes = await compile_latex_to_pdf(
+        render_latex(
+            content,
+            contact_name="Alex Morgan",
+            contact_email="alex@example.com",
+            contact_phone="(555) 010-1000",
+        )
+    )
+
+    assert len(PdfReader(io.BytesIO(pdf_bytes)).pages) == 1
 
 
 @pytest.mark.asyncio
