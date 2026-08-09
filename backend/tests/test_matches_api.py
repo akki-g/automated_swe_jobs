@@ -9,11 +9,22 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import async_sessionmaker, create_async_engine
 
 from app.api.auth import router as auth_router
+from app.api.matches import get_email_provider
 from app.api.matches import router as matches_router
 from app.db.models import Base
 from app.db.models import Match as MatchRow
 from app.db.models import Posting as PostingRow
 from app.db.models import User
+
+
+class FakeEmailProvider:
+    def __init__(self, success: bool = True):
+        self.success = success
+        self.sent: list[tuple] = []
+
+    async def send(self, to, subject, body, html=None):
+        self.sent.append((to, subject, body, html))
+        return self.success
 
 
 @pytest.fixture
@@ -29,7 +40,9 @@ async def web_app(monkeypatch):
     app = FastAPI()
     app.include_router(auth_router)
     app.include_router(matches_router)
-    yield app, session_factory
+    fake_email = FakeEmailProvider()
+    app.dependency_overrides[get_email_provider] = lambda: fake_email
+    yield app, session_factory, fake_email
     await engine.dispose()
 
 
@@ -57,6 +70,7 @@ async def _seed_posting_and_match(
     matched_target_field: str | None = None,
     saved: bool = False,
     created_at: datetime | None = None,
+    posting_status: str = "open",
 ) -> int:
     created_at = created_at or datetime.now(UTC)
     async with session_factory() as session:
@@ -68,7 +82,7 @@ async def _seed_posting_and_match(
             url="https://example.com/job",
             location=location,
             role_type="new_grad",
-            status="open",
+            status=posting_status,
             first_seen_at=created_at,
             last_seen_at=created_at,
         )
@@ -100,7 +114,7 @@ async def _get_user_id(session_factory) -> int:
 
 @pytest.mark.asyncio
 async def test_list_matches_returns_only_current_users_matches(web_app):
-    app, session_factory = web_app
+    app, session_factory, _fake_email = web_app
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
@@ -132,7 +146,7 @@ async def test_list_matches_returns_only_current_users_matches(web_app):
 
 @pytest.mark.asyncio
 async def test_list_matches_requires_authentication(web_app):
-    app, _session_factory = web_app
+    app, _session_factory, _fake_email = web_app
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
@@ -142,7 +156,7 @@ async def test_list_matches_requires_authentication(web_app):
 
 @pytest.mark.asyncio
 async def test_list_matches_filters_by_company_location_and_priority(web_app):
-    app, session_factory = web_app
+    app, session_factory, _fake_email = web_app
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
@@ -166,7 +180,7 @@ async def test_list_matches_filters_by_company_location_and_priority(web_app):
 
 @pytest.mark.asyncio
 async def test_list_matches_filters_by_target_field_min_score_and_saved(web_app):
-    app, session_factory = web_app
+    app, session_factory, _fake_email = web_app
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
@@ -195,7 +209,7 @@ async def test_list_matches_filters_by_target_field_min_score_and_saved(web_app)
 
 @pytest.mark.asyncio
 async def test_list_matches_new_only_uses_previous_last_viewed_at(web_app):
-    app, session_factory = web_app
+    app, session_factory, _fake_email = web_app
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
@@ -227,7 +241,7 @@ async def test_list_matches_new_only_uses_previous_last_viewed_at(web_app):
 
 @pytest.mark.asyncio
 async def test_list_matches_is_paginated(web_app):
-    app, session_factory = web_app
+    app, session_factory, _fake_email = web_app
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
@@ -244,7 +258,7 @@ async def test_list_matches_is_paginated(web_app):
 
 @pytest.mark.asyncio
 async def test_save_match_toggles_flag(web_app):
-    app, session_factory = web_app
+    app, session_factory, _fake_email = web_app
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
@@ -266,7 +280,7 @@ async def test_save_match_toggles_flag(web_app):
 
 @pytest.mark.asyncio
 async def test_save_match_rejects_missing_csrf(web_app):
-    app, session_factory = web_app
+    app, session_factory, _fake_email = web_app
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
@@ -281,7 +295,7 @@ async def test_save_match_rejects_missing_csrf(web_app):
 
 @pytest.mark.asyncio
 async def test_save_match_404s_for_another_users_match(web_app):
-    app, session_factory = web_app
+    app, session_factory, _fake_email = web_app
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
@@ -315,7 +329,7 @@ async def test_is_new_and_new_only_survive_repeated_loads_in_one_visit(web_app):
     anything: opening the page moved the watermark to now, and ticking the
     box is the very next request. The watermark must hold still for a visit.
     """
-    app, session_factory = web_app
+    app, session_factory, _fake_email = web_app
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
@@ -342,7 +356,7 @@ async def test_is_new_and_new_only_survive_repeated_loads_in_one_visit(web_app):
 async def test_a_later_visit_rebaselines_what_counts_as_new(web_app):
     """The flip side: once the visit window has elapsed, coming back must
     re-baseline, or everything would stay "New" forever."""
-    app, session_factory = web_app
+    app, session_factory, _fake_email = web_app
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
@@ -367,3 +381,144 @@ async def test_a_later_visit_rebaselines_what_counts_as_new(web_app):
         # Returning re-baselines to the previous visit, which this match
         # predates by two days.
         assert (await client.get("/api/matches")).json()["items"][0]["is_new"] is False
+
+
+@pytest.mark.asyncio
+async def test_list_matches_excludes_postings_link_validation_marked_closed(web_app):
+    """A dead link (see ingest/link_check.py) must not keep showing up as a
+    match just because the row predates that check."""
+    app, session_factory, _fake_email = web_app
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await _signup(client)
+        user_id = await _get_user_id(session_factory)
+        await _seed_posting_and_match(session_factory, user_id=user_id, company="Alive Co")
+        await _seed_posting_and_match(
+            session_factory, user_id=user_id, company="Dead Co", posting_status="closed"
+        )
+
+        response = await client.get("/api/matches")
+
+        assert [item["company"] for item in response.json()["items"]] == ["Alive Co"]
+
+
+@pytest.mark.asyncio
+async def test_resend_email_sends_curated_current_matches(web_app):
+    app, session_factory, fake_email = web_app
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await _signup(client, "alex@example.com")
+        user_id = await _get_user_id(session_factory)
+        await _seed_posting_and_match(session_factory, user_id=user_id, company="Acme", score=0.9)
+
+        response = await client.post("/api/matches/resend-email", headers=_csrf(client))
+
+        assert response.status_code == 200
+        assert response.json() == {"sent": True, "match_count": 1}
+        assert len(fake_email.sent) == 1
+        to, subject, text, html = fake_email.sent[0]
+        assert to == "alex@example.com"
+        assert "Acme" in text
+        assert "Acme" in html
+
+
+@pytest.mark.asyncio
+async def test_resend_email_excludes_closed_postings(web_app):
+    app, session_factory, fake_email = web_app
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await _signup(client, "alex@example.com")
+        user_id = await _get_user_id(session_factory)
+        await _seed_posting_and_match(
+            session_factory, user_id=user_id, company="Dead Co", posting_status="closed"
+        )
+
+        response = await client.post("/api/matches/resend-email", headers=_csrf(client))
+
+        assert response.status_code == 200
+        assert response.json()["match_count"] == 0
+        assert "Dead Co" not in fake_email.sent[0][2]
+
+
+@pytest.mark.asyncio
+async def test_resend_email_requires_csrf(web_app):
+    app, session_factory, _fake_email = web_app
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await _signup(client)
+        response = await client.post("/api/matches/resend-email")
+        assert response.status_code == 403
+
+
+@pytest.mark.asyncio
+async def test_resend_email_requires_authentication(web_app):
+    app, _session_factory, _fake_email = web_app
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        response = await client.post("/api/matches/resend-email")
+        assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_resend_email_422s_without_an_email_address(web_app):
+    app, session_factory, _fake_email = web_app
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await _signup(client)
+        async with session_factory() as session:
+            user = (await session.execute(select(User))).scalar_one()
+            user.email = None
+            await session.commit()
+
+        response = await client.post("/api/matches/resend-email", headers=_csrf(client))
+
+        assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_resend_email_502s_when_provider_fails(web_app):
+    app, session_factory, fake_email = web_app
+    fake_email.success = False
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await _signup(client)
+        user_id = await _get_user_id(session_factory)
+        await _seed_posting_and_match(session_factory, user_id=user_id)
+
+        response = await client.post("/api/matches/resend-email", headers=_csrf(client))
+
+        assert response.status_code == 502
+
+
+@pytest.mark.asyncio
+async def test_resend_email_ignores_another_users_matches(web_app):
+    app, session_factory, fake_email = web_app
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await _signup(client, "alex@example.com")
+
+        async with session_factory() as session:
+            other = User(
+                name="Sam",
+                email="sam@example.com",
+                sms_provider="signalwire",
+                opted_out=False,
+                created_at=datetime.now(UTC),
+            )
+            session.add(other)
+            await session.commit()
+            other_id = other.id
+        await _seed_posting_and_match(session_factory, user_id=other_id, company="Other Co")
+
+        response = await client.post("/api/matches/resend-email", headers=_csrf(client))
+
+        assert response.json()["match_count"] == 0
+        assert "Other Co" not in fake_email.sent[0][2]

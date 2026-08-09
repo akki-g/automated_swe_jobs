@@ -76,7 +76,7 @@ def _union_by_match(
     return merged
 
 
-def _matches_url() -> str:
+def matches_url() -> str:
     """Deep link back to the web app's matches view — App.tsx reads
     ?view=matches on load and opens MatchesPage directly (no client-side
     router to otherwise intercept a path like /matches — see
@@ -121,7 +121,7 @@ def _format_email_digest(
         overall_cap=settings.digest_max_email_matches,
         per_company_cap=settings.digest_max_per_company,
     )
-    text, html = render_digest_email(user.name, curated, _matches_url())
+    text, html = render_digest_email(user.name, curated, matches_url())
     return text, html, curated
 
 

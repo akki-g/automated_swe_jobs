@@ -13,6 +13,7 @@ import {
   Mail,
   MapPin,
   Pencil,
+  RefreshCw,
   Settings as SettingsIcon,
   Sparkles,
   UploadCloud,
@@ -526,6 +527,8 @@ function ProfileEditor({
   const [error, setError] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsSaved, setSettingsSaved] = useState(false);
+  const [resendBusy, setResendBusy] = useState(false);
+  const [resendMessage, setResendMessage] = useState<{ ok: boolean; text: string } | null>(null);
   // Lets notification emails deep-link straight to the matches view (e.g.
   // "?view=matches") even though this app has no client-side router — see
   // notify/dispatch.py::_matches_url on the backend.
@@ -581,6 +584,30 @@ function ProfileEditor({
     finally { setBusy(false); }
   }
 
+  async function resendEmail() {
+    setResendBusy(true);
+    setResendMessage(null);
+    try {
+      const result = await api<{ sent: boolean; match_count: number }>("/matches/resend-email", {
+        method: "POST",
+      });
+      setResendMessage({
+        ok: true,
+        text:
+          result.match_count > 0
+            ? `Sent — ${result.match_count} match${result.match_count === 1 ? "" : "es"}.`
+            : "Sent — no matches yet, but check your inbox.",
+      });
+    } catch (caught) {
+      setResendMessage({
+        ok: false,
+        text: caught instanceof ApiError ? caught.message : "Could not send the email.",
+      });
+    } finally {
+      setResendBusy(false);
+    }
+  }
+
   if (matchesOpen && profile.profile_completed) {
     return <MatchesPage onBack={closeMatches} onLogout={onLogout} />;
   }
@@ -611,10 +638,23 @@ function ProfileEditor({
         <main className="dashboard">
           <section className="welcome-block"><p className="eyebrow">Your signal is live</p><h1>We’ll take it from here, {profile.name.split(" ")[0]}.</h1><p>Your profile is matched against new roles throughout the day. One focused digest lands each morning.</p></section>
           <section className="status-grid">
-            <article className="status-card accent"><span className="status-icon"><Mail /></span><div><small>Daily delivery</small><h3>{profile.email_digest_enabled ? `On · ${displayTime(profile.email_digest_time)}` : "Paused"}</h3><p>{profile.email}</p></div></article>
+            <article className="status-card accent">
+              <span className="status-icon"><Mail /></span>
+              <div>
+                <small>Daily delivery</small>
+                <h3>{profile.email_digest_enabled ? `On · ${displayTime(profile.email_digest_time)}` : "Paused"}</h3>
+                <p>{profile.email}</p>
+                <button type="button" className="resend-button" disabled={resendBusy || !profile.email} onClick={resendEmail}>
+                  <RefreshCw size={13} className={resendBusy ? "spin" : undefined} /> {resendBusy ? "Sending…" : "Resend email now"}
+                </button>
+              </div>
+            </article>
             <article className="status-card"><span className="status-icon"><BriefcaseBusiness /></span><div><small>Opportunity types</small><h3>{profile.role_types.map((role) => role === "new_grad" ? "New grad" : "Internships").join(" + ")}</h3><p>{profile.target_fields.length} target field{profile.target_fields.length === 1 ? "" : "s"}</p></div></article>
             <article className="status-card"><span className="status-icon"><FileText /></span><div><small>Resume signal</small><h3>{profile.resume_profile.skills?.length ? `${profile.resume_profile.skills.length} skills found` : "Not added"}</h3><p>{profile.resume_profile.experience_level?.replace("_", " ") ?? "Add one anytime"}</p></div></article>
           </section>
+          {resendMessage && (
+            <p className={resendMessage.ok ? "form-success" : "form-error"} role="status">{resendMessage.text}</p>
+          )}
           <section className="profile-summary">
             <div className="summary-heading"><div><p className="eyebrow">Matching profile</p><h2>What we’re looking for</h2></div><button className="secondary-button" onClick={() => { setEditing(true); setStep(1); }}><Pencil size={15} /> Adjust</button></div>
             <div className="summary-columns"><div><h4>Fields</h4>{profile.target_fields.map((field) => <span className="summary-pill" key={field}>{FIELDS.find((item) => item.value === field)?.label}</span>)}</div><div><h4>Locations</h4><p><MapPin size={15} /> {profile.locations.length ? profile.locations.join(" · ") : "Anywhere"}</p></div><div><h4>Keywords</h4><p>{profile.keywords.length ? profile.keywords.join(" · ") : "Resume and field signals"}</p></div></div>

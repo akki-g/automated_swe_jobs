@@ -9,9 +9,14 @@ from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.auth.security import get_current_user, get_db_session, require_csrf
+from app.config import settings
 from app.db.models import Match as MatchRow
 from app.db.models import Posting as PostingRow
 from app.db.models import User
+from app.notify.curate import curate_matches
+from app.notify.dispatch import matches_url
+from app.notify.email_resend import ResendEmailProvider
+from app.notify.email_template import render_digest_email
 
 router = APIRouter(prefix="/api/matches", tags=["matches"])
 
@@ -70,6 +75,15 @@ class SaveResponse(BaseModel):
     saved: bool
 
 
+class ResendEmailResponse(BaseModel):
+    sent: bool
+    match_count: int
+
+
+def get_email_provider() -> ResendEmailProvider:
+    return ResendEmailProvider()
+
+
 @router.get("", response_model=MatchListResponse)
 async def list_matches(
     user: Annotated[User, Depends(get_current_user)],
@@ -116,7 +130,15 @@ async def list_matches(
     previous_viewed_at = visit_started_at if is_new_visit else user.matches_last_viewed_at
     previous_viewed_utc = _as_utc(previous_viewed_at)
 
-    conditions = [MatchRow.user_id == user.id]
+    conditions = [
+        MatchRow.user_id == user.id,
+        # A posting link-validation already confirmed dead (see
+        # ingest/link_check.py / pipeline.match_new_postings) must not
+        # keep showing up as a "match" here just because the row predates
+        # that check — the whole point of validating links is that a dead
+        # one is never presented as available.
+        PostingRow.status != "closed",
+    ]
     if company:
         conditions.append(PostingRow.company.ilike(f"%{company}%"))
     if location:
@@ -209,3 +231,43 @@ async def save_match(
     match_row.saved = body.saved
     await session.commit()
     return SaveResponse(id=match_row.id, saved=match_row.saved)
+
+
+@router.post("/resend-email", response_model=ResendEmailResponse, dependencies=[Depends(require_csrf)])
+async def resend_email(
+    user: Annotated[User, Depends(get_current_user)],
+    session: Annotated[AsyncSession, Depends(get_db_session)],
+    email_provider: Annotated[ResendEmailProvider, Depends(get_email_provider)],
+) -> ResendEmailResponse:
+    """On-demand "send me my matches now", triggered explicitly from the
+    dashboard. Deliberately independent of the automated daily_email_cycle:
+    it ignores email_digest_enabled (a manual action shouldn't be blocked by
+    the automatic-subscription toggle) and never touches
+    last_email_digest_sent_on or notified_channels, so pressing this can
+    never cause the automated pipeline to skip or double-send anything it
+    still owes the user — this is a separate action, not a substitute.
+    """
+    if not user.email:
+        raise HTTPException(status_code=422, detail="Add an email address to your profile first")
+
+    rows = (
+        await session.execute(
+            select(MatchRow, PostingRow)
+            .join(PostingRow, MatchRow.posting_id == PostingRow.id)
+            .where(MatchRow.user_id == user.id, PostingRow.status != "closed")
+            .order_by(MatchRow.score.desc(), MatchRow.created_at.desc())
+            .limit(200)
+        )
+    ).all()
+    matches = [(match_row, posting_row) for match_row, posting_row in rows]
+
+    curated = curate_matches(
+        matches,
+        overall_cap=settings.digest_max_email_matches,
+        per_company_cap=settings.digest_max_per_company,
+    )
+    text, html = render_digest_email(user.name, curated, matches_url())
+    success = await email_provider.send(user.email, "Your job matches", text, html=html)
+    if not success:
+        raise HTTPException(status_code=502, detail="Could not send the email right now — try again shortly")
+    return ResendEmailResponse(sent=True, match_count=len(curated))
