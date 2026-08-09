@@ -6,8 +6,10 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 
 from app.api.auth import router as auth_router
+from app.api.matches import router as matches_router
 from app.api.profile import router as profile_router
 from app.api.resume import router as resume_router
+from app.api.resume_tailor import router as resume_tailor_router
 from app.config import settings
 from app.db.session import init_db
 from app.scheduler import build_scheduler
@@ -36,6 +38,8 @@ app.add_middleware(
 app.include_router(auth_router)
 app.include_router(profile_router)
 app.include_router(resume_router)
+app.include_router(resume_tailor_router)
+app.include_router(matches_router)
 app.include_router(webhooks_router)
 
 

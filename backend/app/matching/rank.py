@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from app.config import settings
-from app.domain.models import Criteria, Posting, Priority
+from app.domain.models import Criteria, Posting, Priority, TargetField
 
 logger = logging.getLogger(__name__)
 
@@ -48,6 +48,14 @@ RANK_TOOL = {
                             "type": "string",
                             "description": "One sentence, SMS-length, explaining why this posting fits.",
                         },
+                        "target_field": {
+                            "type": "string",
+                            "description": (
+                                "Which of the seeker's own target_fields (from the criteria "
+                                "payload) this posting best fits. Omit if none fit well."
+                            ),
+                            "enum": [field.value for field in TargetField],
+                        },
                     },
                     "required": ["posting_key", "score", "blurb"],
                 },
@@ -63,6 +71,7 @@ class RankResult:
     posting_key: str
     score: float
     blurb: str
+    target_field: TargetField | None = None
 
 
 class AnthropicClient(Protocol):
@@ -151,6 +160,12 @@ async def _rank_batch(
         logger.warning("rank_postings: LLM call failed for user_id=%s", criteria.user_id, exc_info=True)
         return []
 
+    # The user's own selected fields are the only valid tags — Claude
+    # occasionally free-associates a field the user never chose (or
+    # hallucinates one outside the taxonomy entirely), and that must not be
+    # persisted as if it were an authoritative user-selected classification.
+    valid_target_fields = set(criteria.target_fields)
+
     valid_keys = {p.posting_key for p in postings}
     results: list[RankResult] = []
     for item in tool_input.get("results", []):
@@ -161,7 +176,25 @@ async def _rank_batch(
             score = max(0.0, min(1.0, float(item["score"])))
         except (KeyError, TypeError, ValueError):
             continue
-        results.append(RankResult(posting_key=key, score=score, blurb=str(item.get("blurb", ""))[:300]))
+
+        target_field: TargetField | None = None
+        raw_target_field = item.get("target_field")
+        if raw_target_field is not None:
+            try:
+                candidate = TargetField(raw_target_field)
+            except ValueError:
+                candidate = None
+            if candidate in valid_target_fields:
+                target_field = candidate
+
+        results.append(
+            RankResult(
+                posting_key=key,
+                score=score,
+                blurb=str(item.get("blurb", ""))[:300],
+                target_field=target_field,
+            )
+        )
 
     # A response can be well-formed JSON so far as _extract_tool_input is
     # concerned and still be truncated mid-array by the token limit — that

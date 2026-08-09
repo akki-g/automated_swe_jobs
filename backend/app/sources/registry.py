@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from app.config import settings
+from app.sources.aggregators import PagesXyzSource
 from app.sources.ats import build_ats_sources
 from app.sources.ats.ashby import AshbySource
 from app.sources.ats.greenhouse import GreenhouseSource
@@ -30,6 +32,12 @@ class SourceRegistry:
     def __init__(self) -> None:
         self._by_name: dict[str, Source] = {}
         self._curated_loaded = False
+        # Kept in a separate dict from _by_name (not just a separate flag) so
+        # reliable_tier_sources()'s `list(self._by_name.values())` can never
+        # accidentally include a best-effort aggregator — the fast lane must
+        # never see these regardless of how this class evolves later.
+        self._aggregators_by_name: dict[str, Source] = {}
+        self._aggregators_loaded = False
 
     def _add(self, source: Source) -> Source:
         return self._by_name.setdefault(source.name, source)
@@ -44,6 +52,24 @@ class SourceRegistry:
         for source in build_ats_sources():
             self._add(source)
         self._curated_loaded = True
+
+    def ensure_aggregator_sources(self) -> None:
+        """Load best-effort aggregator sources once (slow-lane only — see
+        default_sources()). Each is gated on its own config being present so
+        an unconfigured aggregator is silently absent rather than erroring."""
+        if self._aggregators_loaded:
+            return
+        if settings.pagesxyz_api_key:
+            source = PagesXyzSource(api_key=settings.pagesxyz_api_key)
+            self._aggregators_by_name.setdefault(source.name, source)
+        self._aggregators_loaded = True
+
+    def aggregator_sources(self) -> list[Source]:
+        """Best-effort, slow-lane-only sources (see spec: Sources —
+        Aggregator feeds) — kept out of reliable_tier_sources() entirely, so
+        the fast lane never touches them."""
+        self.ensure_aggregator_sources()
+        return list(self._aggregators_by_name.values())
 
     def get_or_create_ats_source(self, provider: str, slug: str) -> Source:
         cls = _PROVIDER_CLASSES[provider]
@@ -64,6 +90,8 @@ class SourceRegistry:
         """Test-only: clear all cached instances."""
         self._by_name.clear()
         self._curated_loaded = False
+        self._aggregators_by_name.clear()
+        self._aggregators_loaded = False
 
 
 registry = SourceRegistry()

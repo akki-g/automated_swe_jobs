@@ -39,6 +39,9 @@ class User(Base):
     email_digest_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     email_digest_time: Mapped[str] = mapped_column(String(5), default="08:00")
     last_email_digest_sent_on: Mapped[date | None] = mapped_column(Date, nullable=True)
+    matches_last_viewed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
     criteria: Mapped["Criteria | None"] = relationship(back_populates="user", uselist=False)
@@ -101,6 +104,8 @@ class Match(Base):
     match_reason: Mapped[str] = mapped_column(String(50), default="new_posting")
     notified_channels: Mapped[list[str]] = mapped_column(JSON, default=list)
     notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    matched_target_field: Mapped[str | None] = mapped_column(String(50), nullable=True)
+    saved: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 

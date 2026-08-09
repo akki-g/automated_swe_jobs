@@ -186,5 +186,64 @@ def test_ranking_prompt_uses_target_fields_and_structured_resume_signals():
     assert '"skills": ["market sizing"]' in messages[0]["content"]
 
 
+@pytest.mark.asyncio
+async def test_rank_postings_persists_valid_target_field_tag():
+    postings = [_posting(posting_key="k1")]
+    client = FakeAnthropicClient(
+        {
+            "results": [
+                {
+                    "posting_key": "k1",
+                    "score": 0.8,
+                    "blurb": "good fit",
+                    "target_field": "consulting",
+                }
+            ]
+        }
+    )
+    criteria = Criteria(user_id=1, target_fields=(TargetField.CONSULTING, TargetField.MARKETING))
+
+    results = await rank_postings(postings, criteria, client)
+
+    assert results[0].target_field == TargetField.CONSULTING
+
+
+@pytest.mark.asyncio
+async def test_rank_postings_drops_target_field_not_in_users_selection():
+    """Claude occasionally free-associates a field the user never selected —
+    that must not be persisted as if it were an authoritative user choice."""
+    postings = [_posting(posting_key="k1")]
+    client = FakeAnthropicClient(
+        {
+            "results": [
+                {
+                    "posting_key": "k1",
+                    "score": 0.8,
+                    "blurb": "good fit",
+                    "target_field": "design",  # not in criteria.target_fields below
+                }
+            ]
+        }
+    )
+    criteria = Criteria(user_id=1, target_fields=(TargetField.CONSULTING,))
+
+    results = await rank_postings(postings, criteria, client)
+
+    assert results[0].target_field is None
+
+
+@pytest.mark.asyncio
+async def test_rank_postings_target_field_defaults_to_none_when_absent():
+    postings = [_posting(posting_key="k1")]
+    client = FakeAnthropicClient(
+        {"results": [{"posting_key": "k1", "score": 0.8, "blurb": "good fit"}]}
+    )
+    criteria = Criteria(user_id=1, target_fields=(TargetField.CONSULTING,))
+
+    results = await rank_postings(postings, criteria, client)
+
+    assert results[0].target_field is None
+
+
 # Sponsorship is now a hard rule filter (app.matching.filters), not a
 # priority-demotion signal — see tests/test_filters.py for that coverage.

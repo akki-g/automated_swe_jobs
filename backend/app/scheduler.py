@@ -51,7 +51,10 @@ async def reliable_tier_sources(session) -> list[Source]:
 
 
 async def default_sources(session) -> list[Source]:
-    return await reliable_tier_sources(session)
+    """Everything the slow lane sweeps: reliable tier + watchlist (also used
+    by the fast lane) plus best-effort aggregators (slow-lane only — see
+    spec: Sources, aggregator tier)."""
+    return await reliable_tier_sources(session) + registry.aggregator_sources()
 
 
 async def _mark_channels_delivered(session, match_ids: list[int], channels: list[str]) -> None:

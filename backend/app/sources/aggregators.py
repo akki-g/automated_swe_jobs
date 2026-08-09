@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import logging
 import xml.etree.ElementTree as ET
-from datetime import datetime
+from datetime import UTC, datetime
 from email.utils import parsedate_to_datetime
 
 import httpx
@@ -79,3 +79,83 @@ class RssFeedSource(Source):
             company, _, title = raw_title.partition(" - ")
             return company.strip(), title.strip()
         return self.name, raw_title.strip()
+
+
+class PagesXyzSource(Source):
+    """Adapter for pagesxyz.com's job listings — a third-party board, not a
+    documented public API. Its frontend calls a Supabase PostgREST endpoint
+    directly (found via browser devtools, not published anywhere); we call
+    the same endpoint with the same publishable ("anon"-style, safe to be
+    client-exposed) API key its own frontend uses.
+
+    Best-effort tier by design (see spec: Sources — same reasoning as
+    LinkedIn/Indeed): this is someone else's backend, not a stable contract,
+    so it's slow-lane only (no check_for_changes()) and isolated here so a
+    breaking change on their end never touches the reliable ATS/GitHub
+    backbone.
+    """
+
+    _URL = "https://frlkrjbedjjrtrknuunq.supabase.co/rest/v1/jobs"
+    _SELECT = (
+        "id,company,company_name,title,level,location,apply_link,"
+        "salary_min,salary_max,years_min,years_max,posted_at,categories"
+    )
+
+    def __init__(self, api_key: str, category: str = "software-engineering", limit: int = 1000) -> None:
+        self.name = f"pagesxyz:{category}"
+        self.api_key = api_key
+        self.category = category
+        self.limit = limit
+
+    async def fetch(self) -> list[RawPosting]:
+        params = {
+            "select": self._SELECT,
+            "order": "posted_at.desc,id.asc",
+            "categories": f"ilike.%{self.category}%",
+            "offset": "0",
+            "limit": str(self.limit),
+        }
+        try:
+            async with httpx.AsyncClient(timeout=20) as client:
+                response = await client.get(
+                    self._URL, params=params, headers={"apikey": self.api_key}
+                )
+                response.raise_for_status()
+                entries = response.json()
+        except (httpx.HTTPError, ValueError):
+            logger.warning("%s: fetch failed", self.name, exc_info=True)
+            return []
+
+        postings: list[RawPosting] = []
+        for entry in entries:
+            try:
+                postings.append(self._to_raw_posting(entry))
+            except (KeyError, TypeError):
+                logger.debug("%s: skipping malformed entry: %r", self.name, entry)
+        return postings
+
+    def _to_raw_posting(self, entry: dict) -> RawPosting:
+        title = entry["title"]
+        company = entry.get("company_name") or entry.get("company") or self.name
+        url = entry["apply_link"]
+        if not title or not company or not url:
+            raise KeyError("missing required field")
+
+        posted_at: datetime | None = None
+        raw_posted = entry.get("posted_at")
+        if raw_posted:
+            try:
+                posted_at = datetime.fromisoformat(raw_posted.replace("Z", "+00:00")).astimezone(UTC)
+            except (TypeError, ValueError):
+                posted_at = None
+
+        return RawPosting(
+            source=self.name,
+            company=company,
+            title=title,
+            url=url,
+            location=entry.get("location") or None,
+            role_type=infer_role_type(title),
+            posted_at=posted_at,
+            raw=entry,
+        )

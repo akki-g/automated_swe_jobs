@@ -42,6 +42,7 @@ def _ensure_web_profile_columns(connection) -> None:
         "email_digest_enabled": "BOOLEAN NOT NULL DEFAULT true",
         "email_digest_time": "VARCHAR(5) NOT NULL DEFAULT '08:00'",
         "last_email_digest_sent_on": "DATE",
+        "matches_last_viewed_at": "TIMESTAMP",
     }
     for name, definition in user_additions.items():
         if name not in user_columns:
@@ -56,6 +57,16 @@ def _ensure_web_profile_columns(connection) -> None:
     for name, definition in criteria_additions.items():
         if name not in criteria_columns:
             connection.exec_driver_sql(f"ALTER TABLE criteria ADD COLUMN {name} {definition}")
+
+    if "matches" in inspector.get_table_names():
+        match_columns = {column["name"] for column in inspector.get_columns("matches")}
+        match_additions = {
+            "matched_target_field": "VARCHAR(50)",
+            "saved": "BOOLEAN NOT NULL DEFAULT false",
+        }
+        for name, definition in match_additions.items():
+            if name not in match_columns:
+                connection.exec_driver_sql(f"ALTER TABLE matches ADD COLUMN {name} {definition}")
 
     connection.exec_driver_sql(
         "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_email ON users (email)"

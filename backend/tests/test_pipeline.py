@@ -244,3 +244,77 @@ async def test_match_new_postings_forces_instant_priority_for_watchlisted_compan
     _user, match_row, _posting_row = result.instant[0]
     assert match_row.priority == Priority.HIGH.value
     assert match_row.match_reason == "watchlist"
+
+
+class TargetFieldTaggingRankClient:
+    """Returns the given target_field for every posting_key it's asked
+    about, so tests can assert the tag survives into the persisted
+    MatchRow."""
+
+    def __init__(self, target_field: str | None) -> None:
+        self.target_field = target_field
+
+    async def create_message(self, *, system, messages, tools):
+        keys = re.findall(r'"posting_key":\s*"([^"]+)"', messages[0]["content"])
+        results = [
+            {"posting_key": key, "score": 0.5, "blurb": "ok", "target_field": self.target_field}
+            for key in keys
+            if self.target_field is not None
+        ] or [{"posting_key": key, "score": 0.5, "blurb": "ok"} for key in keys]
+        return {"content": [{"type": "tool_use", "name": tools[0]["name"], "input": {"results": results}}]}
+
+
+@pytest.mark.asyncio
+async def test_match_new_postings_persists_matched_target_field(db_session, demo_user):
+    db_session.add(
+        CriteriaRow(
+            user_id=demo_user.id,
+            role_types=["new_grad"],
+            target_fields=["consulting"],
+            keywords=[],
+            locations=[],
+            sponsorship_required=None,
+            freeform_notes="",
+            updated_at=datetime.now(UTC),
+        )
+    )
+    await db_session.flush()
+
+    posting = _posting()
+    new_rows = await store_new_postings(db_session, [posting])
+
+    result = await match_new_postings(
+        db_session, new_rows, TargetFieldTaggingRankClient("consulting"), lane="slow"
+    )
+    await db_session.commit()
+
+    _match_row, _posting_row = result.digest_items[0].matches[0]
+    assert _match_row.matched_target_field == "consulting"
+
+
+@pytest.mark.asyncio
+async def test_match_new_postings_leaves_matched_target_field_none_when_untagged(db_session, demo_user):
+    db_session.add(
+        CriteriaRow(
+            user_id=demo_user.id,
+            role_types=["new_grad"],
+            target_fields=["consulting"],
+            keywords=[],
+            locations=[],
+            sponsorship_required=None,
+            freeform_notes="",
+            updated_at=datetime.now(UTC),
+        )
+    )
+    await db_session.flush()
+
+    posting = _posting()
+    new_rows = await store_new_postings(db_session, [posting])
+
+    result = await match_new_postings(
+        db_session, new_rows, TargetFieldTaggingRankClient(None), lane="slow"
+    )
+    await db_session.commit()
+
+    _match_row, _posting_row = result.digest_items[0].matches[0]
+    assert _match_row.matched_target_field is None

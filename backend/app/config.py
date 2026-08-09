@@ -38,6 +38,10 @@ class Settings(BaseSettings):
     resend_api_key: str = ""
     resend_from_email: str = ""
 
+    # Publishable (client-exposed-by-design) Supabase key pagesxyz.com's own
+    # frontend uses against its jobs endpoint — see app/sources/aggregators.py.
+    pagesxyz_api_key: str = ""
+
     fast_lane_interval_minutes: int = 2
     slow_lane_interval_minutes: int = 15
     digest_hours: str = "8,20"  # comma-separated hours (local time) for the digest cron

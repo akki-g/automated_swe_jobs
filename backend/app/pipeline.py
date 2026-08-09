@@ -304,6 +304,9 @@ async def match_new_postings(
                 match_reason="watchlist" if is_watched else "new_posting",
                 notified_channels=[],
                 notified_at=None,
+                matched_target_field=(
+                    rank_result.target_field.value if rank_result.target_field else None
+                ),
                 created_at=now,
             )
             session.add(match_row)

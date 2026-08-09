@@ -46,3 +46,37 @@ export interface Profile {
   email_digest_time: string;
   profile_completed: boolean;
 }
+
+export type Priority = "high" | "normal";
+
+export interface MatchItem {
+  id: number;
+  company: string;
+  title: string;
+  url: string;
+  location: string | null;
+  role_type: RoleType | null;
+  posted_at: string | null;
+  score: number;
+  blurb: string;
+  priority: Priority;
+  matched_target_field: TargetField | null;
+  saved: boolean;
+  created_at: string;
+  is_new: boolean;
+}
+
+export interface MatchListResponse {
+  items: MatchItem[];
+  total: number;
+}
+
+export interface MatchFilters {
+  company?: string;
+  location?: string;
+  target_field?: TargetField;
+  priority?: Priority;
+  min_score?: number;
+  saved?: boolean;
+  new_only?: boolean;
+}

@@ -91,3 +91,58 @@ def test_reset_clears_cached_instances():
     reg.reset()
     b = reg.get_or_create_ats_source("greenhouse", "acme")
     assert a is not b
+
+
+def test_aggregator_sources_empty_when_no_pagesxyz_key_configured(monkeypatch):
+    from app.sources import registry as registry_module
+
+    monkeypatch.setattr(registry_module.settings, "pagesxyz_api_key", "")
+    reg = SourceRegistry()
+
+    assert reg.aggregator_sources() == []
+
+
+def test_aggregator_sources_includes_pagesxyz_when_key_configured(monkeypatch):
+    from app.sources import registry as registry_module
+
+    monkeypatch.setattr(registry_module.settings, "pagesxyz_api_key", "test-key")
+    reg = SourceRegistry()
+
+    sources = reg.aggregator_sources()
+
+    assert len(sources) == 1
+    assert sources[0].name == "pagesxyz:software-engineering"
+
+
+def test_aggregator_sources_never_leak_into_reliable_tier_sources(monkeypatch, companies_yaml):
+    """The fast lane calls reliable_tier_sources(); a best-effort aggregator
+    must never appear there regardless of call order."""
+    from app.sources import registry as registry_module
+    from app.sources.ats import build_ats_sources
+    from app.sources.github_lists import internship_source, new_grad_source
+
+    monkeypatch.setattr(registry_module.settings, "pagesxyz_api_key", "test-key")
+    reg = SourceRegistry()
+    reg._add(new_grad_source())
+    reg._add(internship_source())
+    for source in build_ats_sources(companies_yaml):
+        reg._add(source)
+    reg._curated_loaded = True
+
+    reg.aggregator_sources()  # populate aggregators first
+    reliable_names = {source.name for source in reg.reliable_tier_sources()}
+
+    assert not any(name.startswith("pagesxyz:") for name in reliable_names)
+
+
+def test_aggregator_sources_is_idempotent():
+    from app.sources import registry as registry_module
+
+    reg = SourceRegistry()
+    registry_module.settings.pagesxyz_api_key = "test-key"
+    try:
+        first = reg.aggregator_sources()
+        second = reg.aggregator_sources()
+        assert [id(s) for s in first] == [id(s) for s in second]
+    finally:
+        registry_module.settings.pagesxyz_api_key = ""

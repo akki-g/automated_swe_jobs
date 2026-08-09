@@ -1,10 +1,13 @@
 import { FormEvent, useEffect, useMemo, useRef, useState } from "react";
 import {
   ArrowRight,
+  Bookmark,
   BriefcaseBusiness,
   Check,
   ChevronLeft,
+  FileDown,
   FileText,
+  ListFilter,
   LockKeyhole,
   LogOut,
   Mail,
@@ -14,8 +17,17 @@ import {
   Sparkles,
   UploadCloud,
 } from "lucide-react";
-import { api, ApiError } from "./api";
-import type { Profile, ResumeProfile, RoleType, TargetField, User } from "./types";
+import { api, apiBlob, ApiError } from "./api";
+import type {
+  MatchFilters,
+  MatchItem,
+  MatchListResponse,
+  Profile,
+  ResumeProfile,
+  RoleType,
+  TargetField,
+  User,
+} from "./types";
 
 const FIELDS: Array<{ value: TargetField; label: string; detail: string }> = [
   { value: "software_engineering", label: "Software engineering", detail: "Web, mobile, systems, infrastructure" },
@@ -212,6 +224,228 @@ function ResumePanel({ profile, onUploaded, onApplyFields }: { profile: Profile;
   );
 }
 
+function buildMatchQuery(filters: MatchFilters): string {
+  const params = new URLSearchParams();
+  if (filters.company) params.set("company", filters.company);
+  if (filters.location) params.set("location", filters.location);
+  if (filters.target_field) params.set("target_field", filters.target_field);
+  if (filters.priority) params.set("priority", filters.priority);
+  if (filters.min_score !== undefined) params.set("min_score", String(filters.min_score));
+  if (filters.saved) params.set("saved", "true");
+  if (filters.new_only) params.set("new_only", "true");
+  const query = params.toString();
+  return query ? `?${query}` : "";
+}
+
+function MatchesPage({ onBack, onLogout }: { onBack: () => void; onLogout: () => void }) {
+  const [items, setItems] = useState<MatchItem[]>([]);
+  const [total, setTotal] = useState(0);
+  const [filters, setFilters] = useState<MatchFilters>({});
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState("");
+  const [selected, setSelected] = useState<Set<number>>(new Set());
+  const [tailoring, setTailoring] = useState(false);
+  const [tailorError, setTailorError] = useState("");
+  const fileInput = useRef<HTMLInputElement>(null);
+
+  async function load(withFilters: MatchFilters = filters) {
+    setLoading(true);
+    setError("");
+    try {
+      const result = await api<MatchListResponse>(`/matches${buildMatchQuery(withFilters)}`);
+      setItems(result.items);
+      setTotal(result.total);
+    } catch (caught) {
+      setError(caught instanceof ApiError ? caught.message : "Could not load matches.");
+    } finally {
+      setLoading(false);
+    }
+  }
+
+  // Text filters (company/location) are applied on blur/Enter below, not on
+  // every keystroke; select/checkbox filters (including the initial load)
+  // are immediate since there's no typing to debounce.
+  useEffect(() => {
+    load();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [filters.target_field, filters.priority, filters.saved, filters.new_only]);
+
+  function toggleSelected(id: number) {
+    setSelected((current) => {
+      const next = new Set(current);
+      if (next.has(id)) next.delete(id);
+      else next.add(id);
+      return next;
+    });
+  }
+
+  async function toggleSaved(item: MatchItem) {
+    const nextSaved = !item.saved;
+    setItems((current) => current.map((row) => (row.id === item.id ? { ...row, saved: nextSaved } : row)));
+    try {
+      await api(`/matches/${item.id}/save`, { method: "POST", body: JSON.stringify({ saved: nextSaved }) });
+    } catch {
+      // Roll back on failure — the optimistic flip above didn't stick server-side.
+      setItems((current) => current.map((row) => (row.id === item.id ? { ...row, saved: item.saved } : row)));
+    }
+  }
+
+  async function tailorSelected(file?: File) {
+    if (!file || selected.size === 0) return;
+    setTailoring(true);
+    setTailorError("");
+    try {
+      const form = new FormData();
+      form.append("file", file);
+      selected.forEach((id) => form.append("posting_ids", String(id)));
+      const { blob, filename } = await apiBlob("/resume/tailor", { method: "POST", body: form });
+      const url = URL.createObjectURL(blob);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      link.click();
+      URL.revokeObjectURL(url);
+    } catch (caught) {
+      setTailorError(
+        caught instanceof ApiError ? caught.message : "Could not tailor a resume for those postings.",
+      );
+    } finally {
+      setTailoring(false);
+      if (fileInput.current) fileInput.current.value = "";
+    }
+  }
+
+  return (
+    <div className="app-shell">
+      <header className="app-header">
+        <Brand />
+        <div className="header-actions">
+          <button onClick={onBack}><ChevronLeft size={15} /> Dashboard</button>
+          <button onClick={onLogout}><LogOut size={15} /> Sign out</button>
+        </div>
+      </header>
+      <main className="matches-page">
+      <section className="matches-heading">
+        <div>
+          <p className="eyebrow">Your matches</p>
+          <h1>Everything ranked for you.</h1>
+          <p className="subtle">{total} match{total === 1 ? "" : "es"} on file.</p>
+        </div>
+      </section>
+
+      <section className="matches-filters">
+        <span className="filters-label"><ListFilter size={14} /> Filters</span>
+        <input
+          placeholder="Company"
+          value={filters.company ?? ""}
+          onChange={(event) => setFilters({ ...filters, company: event.target.value || undefined })}
+          onBlur={() => load()}
+          onKeyDown={(event) => event.key === "Enter" && load()}
+        />
+        <input
+          placeholder="Location"
+          value={filters.location ?? ""}
+          onChange={(event) => setFilters({ ...filters, location: event.target.value || undefined })}
+          onBlur={() => load()}
+          onKeyDown={(event) => event.key === "Enter" && load()}
+        />
+        <select
+          value={filters.target_field ?? ""}
+          onChange={(event) =>
+            setFilters({ ...filters, target_field: (event.target.value || undefined) as TargetField | undefined })
+          }
+        >
+          <option value="">All fields</option>
+          {FIELDS.map((field) => (
+            <option key={field.value} value={field.value}>{field.label}</option>
+          ))}
+        </select>
+        <select
+          value={filters.priority ?? ""}
+          onChange={(event) =>
+            setFilters({ ...filters, priority: (event.target.value || undefined) as MatchFilters["priority"] })
+          }
+        >
+          <option value="">Any priority</option>
+          <option value="high">High fit</option>
+          <option value="normal">Normal</option>
+        </select>
+        <label className="filter-toggle">
+          <input
+            type="checkbox"
+            checked={!!filters.saved}
+            onChange={(event) => setFilters({ ...filters, saved: event.target.checked || undefined })}
+          /> Saved only
+        </label>
+        <label className="filter-toggle">
+          <input
+            type="checkbox"
+            checked={!!filters.new_only}
+            onChange={(event) => setFilters({ ...filters, new_only: event.target.checked || undefined })}
+          /> New since last visit
+        </label>
+      </section>
+
+      {selected.size > 0 && (
+        <section className="tailor-bar">
+          <span><FileDown size={16} /> Tailor a resume for {selected.size} selected job{selected.size === 1 ? "" : "s"}</span>
+          <input
+            ref={fileInput}
+            className="visually-hidden"
+            type="file"
+            accept=".pdf,.docx,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            onChange={(event) => tailorSelected(event.target.files?.[0])}
+          />
+          <button className="primary-button narrow" disabled={tailoring} onClick={() => fileInput.current?.click()}>
+            {tailoring ? "Tailoring…" : "Upload resume & generate"}
+          </button>
+        </section>
+      )}
+      {tailorError && <p className="form-error" role="alert">{tailorError}</p>}
+      {error && <p className="form-error" role="alert">{error}</p>}
+
+      {loading ? (
+        <p className="subtle">Loading matches…</p>
+      ) : items.length === 0 ? (
+        <p className="subtle">No matches yet for these filters.</p>
+      ) : (
+        <ul className="match-list">
+          {items.map((item) => (
+            <li className={`match-row ${item.is_new ? "is-new" : ""}`} key={item.id}>
+              <input
+                type="checkbox"
+                checked={selected.has(item.id)}
+                onChange={() => toggleSelected(item.id)}
+                aria-label={`Select ${item.company} ${item.title}`}
+              />
+              <div className="match-main">
+                <a href={item.url} target="_blank" rel="noreferrer"><strong>{item.title}</strong></a>
+                <span className="match-meta">{item.company}{item.location ? ` · ${item.location}` : ""}</span>
+                {item.blurb && <p className="match-blurb">{item.blurb}</p>}
+              </div>
+              <div className="match-tags">
+                {item.priority === "high" && <span className="summary-pill high">High fit</span>}
+                {item.matched_target_field && (
+                  <span className="summary-pill">{FIELDS.find((field) => field.value === item.matched_target_field)?.label}</span>
+                )}
+                {item.is_new && <span className="summary-pill new">New</span>}
+              </div>
+              <button
+                className={`save-toggle ${item.saved ? "saved" : ""}`}
+                onClick={() => toggleSaved(item)}
+                aria-label={item.saved ? "Remove from saved" : "Save this match"}
+              >
+                <Bookmark size={16} fill={item.saved ? "currentColor" : "none"} />
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+      </main>
+    </div>
+  );
+}
+
 function ProfileEditor({ initial, onSaved, onLogout }: { initial: Profile; onSaved: (profile: Profile) => void; onLogout: () => void }) {
   const [profile, setProfile] = useState(initial);
   const [step, setStep] = useState(initial.profile_completed ? 4 : 1);
@@ -220,6 +454,7 @@ function ProfileEditor({ initial, onSaved, onLogout }: { initial: Profile; onSav
   const [error, setError] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsSaved, setSettingsSaved] = useState(false);
+  const [matchesOpen, setMatchesOpen] = useState(false);
 
   const progress = useMemo(() => (step >= 4 ? 100 : Math.round((step / 3) * 100)), [step]);
   function toggleField(value: TargetField) {
@@ -260,6 +495,10 @@ function ProfileEditor({ initial, onSaved, onLogout }: { initial: Profile; onSav
     finally { setBusy(false); }
   }
 
+  if (matchesOpen && profile.profile_completed) {
+    return <MatchesPage onBack={() => setMatchesOpen(false)} onLogout={onLogout} />;
+  }
+
   if (settingsOpen && profile.profile_completed) {
     return (
       <div className="app-shell">
@@ -282,7 +521,7 @@ function ProfileEditor({ initial, onSaved, onLogout }: { initial: Profile; onSav
   if (!editing && profile.profile_completed) {
     return (
       <div className="app-shell">
-        <header className="app-header"><Brand /><div className="header-actions"><button onClick={() => { setSettingsOpen(true); setSettingsSaved(false); }}><SettingsIcon size={15} /> Settings</button><button onClick={() => { setEditing(true); setStep(1); }}><Pencil size={15} /> Edit profile</button><button onClick={onLogout}><LogOut size={15} /> Sign out</button></div></header>
+        <header className="app-header"><Brand /><div className="header-actions"><button onClick={() => setMatchesOpen(true)}><ListFilter size={15} /> Matches</button><button onClick={() => { setSettingsOpen(true); setSettingsSaved(false); }}><SettingsIcon size={15} /> Settings</button><button onClick={() => { setEditing(true); setStep(1); }}><Pencil size={15} /> Edit profile</button><button onClick={onLogout}><LogOut size={15} /> Sign out</button></div></header>
         <main className="dashboard">
           <section className="welcome-block"><p className="eyebrow">Your signal is live</p><h1>We’ll take it from here, {profile.name.split(" ")[0]}.</h1><p>Your profile is matched against new roles throughout the day. One focused digest lands each morning.</p></section>
           <section className="status-grid">
