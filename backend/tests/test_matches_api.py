@@ -215,11 +215,14 @@ async def test_list_matches_new_only_uses_previous_last_viewed_at(web_app):
 
         new_match_id = await _seed_posting_and_match(session_factory, user_id=user_id, company="New Co")
 
-        # This call's own "new_only" set is computed against the *previous*
-        # last_viewed_at (before first_call updated it) — only postings
-        # created after that point should show, i.e. just the new one.
+        # Still the same visit, so the baseline has not moved: "new since
+        # last visit" continues to mean everything since the *previous*
+        # visit, which is still both of these. Re-baselining per request
+        # instead would drop the old match from this list and clear its
+        # badge mid-session — see list_matches on why the baseline is
+        # visit-scoped.
         second_call = await client.get("/api/matches", params={"new_only": "true"})
-        assert {item["id"] for item in second_call.json()["items"]} == {new_match_id}
+        assert {item["id"] for item in second_call.json()["items"]} == {old_match_id, new_match_id}
 
 
 @pytest.mark.asyncio
@@ -302,3 +305,65 @@ async def test_save_match_404s_for_another_users_match(web_app):
         )
 
         assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_is_new_and_new_only_survive_repeated_loads_in_one_visit(web_app):
+    """The matches page re-fetches on every filter change. If each request
+    advanced matches_last_viewed_at, the "New" badges would vanish the
+    instant the user touched a filter, and `new_only` could never match
+    anything: opening the page moved the watermark to now, and ticking the
+    box is the very next request. The watermark must hold still for a visit.
+    """
+    app, session_factory = web_app
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await _signup(client)
+        async with session_factory() as session:
+            user = (await session.execute(select(User))).scalar_one()
+            user_id = user.id
+            await session.commit()
+        for index in range(3):
+            await _seed_posting_and_match(session_factory, user_id=user_id, company=f"C{index}")
+
+        first = (await client.get("/api/matches")).json()
+        assert [item["is_new"] for item in first["items"]] == [True, True, True]
+
+        # A filter change — the second request of the same visit.
+        second = (await client.get("/api/matches")).json()
+        assert [item["is_new"] for item in second["items"]] == [True, True, True]
+
+        only_new = (await client.get("/api/matches?new_only=true")).json()
+        assert only_new["total"] == 3
+
+
+@pytest.mark.asyncio
+async def test_a_later_visit_rebaselines_what_counts_as_new(web_app):
+    """The flip side: once the visit window has elapsed, coming back must
+    re-baseline, or everything would stay "New" forever."""
+    app, session_factory = web_app
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await _signup(client)
+        async with session_factory() as session:
+            user = (await session.execute(select(User))).scalar_one()
+            user_id = user.id
+            await session.commit()
+        await _seed_posting_and_match(
+            session_factory, user_id=user_id, created_at=datetime.now(UTC) - timedelta(days=2)
+        )
+
+        # First ever visit: nothing to compare against, so it reads as new.
+        assert (await client.get("/api/matches")).json()["items"][0]["is_new"] is True
+
+        # Age that visit so the next request counts as a fresh one.
+        async with session_factory() as session:
+            user = await session.get(User, user_id)
+            user.matches_visit_started_at = datetime.now(UTC) - timedelta(hours=4)
+            await session.commit()
+
+        # Returning re-baselines to the previous visit, which this match
+        # predates by two days.
+        assert (await client.get("/api/matches")).json()["items"][0]["is_new"] is False

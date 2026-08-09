@@ -26,18 +26,26 @@ class ResendEmailProvider:
         self.api_key = api_key or settings.resend_api_key
         self.from_email = from_email or settings.resend_from_email
 
-    async def send(self, to: str, subject: str, body: str) -> bool:
+    async def send(self, to: str, subject: str, body: str, html: str | None = None) -> bool:
+        """`body` is always sent as the plain-text part (required — some
+        clients/spam filters prefer or require it); `html` is optional and,
+        when given, is sent alongside it as a real multipart email rather
+        than replacing the text part (better deliverability, and a sane
+        fallback for text-only clients)."""
+        payload = {
+            "from": self.from_email,
+            "to": [to],
+            "subject": subject,
+            "text": body,
+        }
+        if html is not None:
+            payload["html"] = html
         try:
             async with httpx.AsyncClient(timeout=15) as client:
                 response = await client.post(
                     _RESEND_API_URL,
                     headers={"Authorization": f"Bearer {self.api_key}"},
-                    json={
-                        "from": self.from_email,
-                        "to": [to],
-                        "subject": subject,
-                        "text": body,
-                    },
+                    json=payload,
                 )
                 response.raise_for_status()
             return True

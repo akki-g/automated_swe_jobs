@@ -224,7 +224,13 @@ function ResumePanel({ profile, onUploaded, onApplyFields }: { profile: Profile;
   );
 }
 
-function buildMatchQuery(filters: MatchFilters): string {
+// The API caps a page at 200 and defaults to 50. Requesting a page
+// explicitly (rather than relying on that default) is what makes "Show more"
+// able to reach past the first page at all — without it the list silently
+// stopped at 50 while the header still counted every match.
+const PAGE_SIZE = 25;
+
+function buildMatchQuery(filters: MatchFilters, offset: number): string {
   const params = new URLSearchParams();
   if (filters.company) params.set("company", filters.company);
   if (filters.location) params.set("location", filters.location);
@@ -233,8 +239,9 @@ function buildMatchQuery(filters: MatchFilters): string {
   if (filters.min_score !== undefined) params.set("min_score", String(filters.min_score));
   if (filters.saved) params.set("saved", "true");
   if (filters.new_only) params.set("new_only", "true");
-  const query = params.toString();
-  return query ? `?${query}` : "";
+  params.set("limit", String(PAGE_SIZE));
+  params.set("offset", String(offset));
+  return `?${params.toString()}`;
 }
 
 function MatchesPage({ onBack, onLogout }: { onBack: () => void; onLogout: () => void }) {
@@ -242,23 +249,37 @@ function MatchesPage({ onBack, onLogout }: { onBack: () => void; onLogout: () =>
   const [total, setTotal] = useState(0);
   const [filters, setFilters] = useState<MatchFilters>({});
   const [loading, setLoading] = useState(true);
+  const [loadingMore, setLoadingMore] = useState(false);
   const [error, setError] = useState("");
   const [selected, setSelected] = useState<Set<number>>(new Set());
   const [tailoring, setTailoring] = useState(false);
   const [tailorError, setTailorError] = useState("");
   const fileInput = useRef<HTMLInputElement>(null);
 
-  async function load(withFilters: MatchFilters = filters) {
-    setLoading(true);
+  // Guards against an out-of-order response overwriting a newer one: two
+  // loads can be in flight at once (blurring a text field while changing a
+  // select fires both), and the slower request must not win.
+  const requestId = useRef(0);
+
+  async function load(withFilters: MatchFilters = filters, { append = false } = {}) {
+    const ticket = ++requestId.current;
+    if (append) setLoadingMore(true);
+    else setLoading(true);
     setError("");
     try {
-      const result = await api<MatchListResponse>(`/matches${buildMatchQuery(withFilters)}`);
-      setItems(result.items);
+      const offset = append ? items.length : 0;
+      const result = await api<MatchListResponse>(`/matches${buildMatchQuery(withFilters, offset)}`);
+      if (ticket !== requestId.current) return;
+      setItems((current) => (append ? [...current, ...result.items] : result.items));
       setTotal(result.total);
     } catch (caught) {
+      if (ticket !== requestId.current) return;
       setError(caught instanceof ApiError ? caught.message : "Could not load matches.");
     } finally {
-      setLoading(false);
+      if (ticket === requestId.current) {
+        setLoading(false);
+        setLoadingMore(false);
+      }
     }
   }
 
@@ -269,6 +290,17 @@ function MatchesPage({ onBack, onLogout }: { onBack: () => void; onLogout: () =>
     load();
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [filters.target_field, filters.priority, filters.saved, filters.new_only]);
+
+  // Selections are only meaningful for rows the user can still see. Keeping
+  // them across a filter change left the tailor bar offering to generate
+  // resumes for jobs that had scrolled out of the result set entirely.
+  useEffect(() => {
+    setSelected((current) => {
+      const visible = new Set(items.map((item) => item.id));
+      const kept = [...current].filter((id) => visible.has(id));
+      return kept.length === current.size ? current : new Set(kept);
+    });
+  }, [items]);
 
   function toggleSelected(id: number) {
     setSelected((current) => {
@@ -297,14 +329,24 @@ function MatchesPage({ onBack, onLogout }: { onBack: () => void; onLogout: () =>
     try {
       const form = new FormData();
       form.append("file", file);
-      selected.forEach((id) => form.append("posting_ids", String(id)));
+      // MatchItem.id is a *match* id, which is the only id this list holds —
+      // the endpoint selects on it directly (see api/resume_tailor.py).
+      selected.forEach((id) => form.append("match_ids", String(id)));
       const { blob, filename } = await apiBlob("/resume/tailor", { method: "POST", body: form });
       const url = URL.createObjectURL(blob);
       const link = document.createElement("a");
       link.href = url;
       link.download = filename;
+      // Firefox only acts on a click if the anchor is in the document, and
+      // revoking the object URL synchronously cancels the download there and
+      // in Safari — so attach it, click, then clean up on the next tick.
+      link.style.display = "none";
+      document.body.appendChild(link);
       link.click();
-      URL.revokeObjectURL(url);
+      setTimeout(() => {
+        document.body.removeChild(link);
+        URL.revokeObjectURL(url);
+      }, 0);
     } catch (caught) {
       setTailorError(
         caught instanceof ApiError ? caught.message : "Could not tailor a resume for those postings.",
@@ -314,6 +356,11 @@ function MatchesPage({ onBack, onLogout }: { onBack: () => void; onLogout: () =>
       if (fileInput.current) fileInput.current.value = "";
     }
   }
+
+  const hasFilters = Boolean(
+    filters.company || filters.location || filters.target_field || filters.priority ||
+    filters.saved || filters.new_only,
+  );
 
   return (
     <div className="app-shell">
@@ -329,7 +376,14 @@ function MatchesPage({ onBack, onLogout }: { onBack: () => void; onLogout: () =>
         <div>
           <p className="eyebrow">Your matches</p>
           <h1>Everything ranked for you.</h1>
-          <p className="subtle">{total} match{total === 1 ? "" : "es"} on file.</p>
+          {/* "on file" would be wrong once a filter narrows the set, since
+              `total` is the count of what matched the filter, not of
+              everything the user has. */}
+          <p className="subtle">
+            {hasFilters
+              ? `${total} match${total === 1 ? "" : "es"} for these filters.`
+              : `${total} match${total === 1 ? "" : "es"} on file.`}
+          </p>
         </div>
       </section>
 
@@ -441,12 +495,30 @@ function MatchesPage({ onBack, onLogout }: { onBack: () => void; onLogout: () =>
           ))}
         </ul>
       )}
+
+      {items.length > 0 && items.length < total && (
+        <div className="match-more">
+          <button className="secondary-button" disabled={loadingMore} onClick={() => load(filters, { append: true })}>
+            {loadingMore ? "Loading…" : `Show more (${total - items.length} left)`}
+          </button>
+        </div>
+      )}
       </main>
     </div>
   );
 }
 
-function ProfileEditor({ initial, onSaved, onLogout }: { initial: Profile; onSaved: (profile: Profile) => void; onLogout: () => void }) {
+function ProfileEditor({
+  initial,
+  onSaved,
+  onLogout,
+  initialView,
+}: {
+  initial: Profile;
+  onSaved: (profile: Profile) => void;
+  onLogout: () => void;
+  initialView?: string | null;
+}) {
   const [profile, setProfile] = useState(initial);
   const [step, setStep] = useState(initial.profile_completed ? 4 : 1);
   const [editing, setEditing] = useState(!initial.profile_completed);
@@ -454,7 +526,21 @@ function ProfileEditor({ initial, onSaved, onLogout }: { initial: Profile; onSav
   const [error, setError] = useState("");
   const [settingsOpen, setSettingsOpen] = useState(false);
   const [settingsSaved, setSettingsSaved] = useState(false);
-  const [matchesOpen, setMatchesOpen] = useState(false);
+  // Lets notification emails deep-link straight to the matches view (e.g.
+  // "?view=matches") even though this app has no client-side router — see
+  // notify/dispatch.py::_matches_url on the backend.
+  const [matchesOpen, setMatchesOpen] = useState(initialView === "matches" && initial.profile_completed);
+
+  function closeMatches() {
+    setMatchesOpen(false);
+    // Drop the deep-link parameter on the way out, or a refresh from the
+    // dashboard would bounce straight back to the matches view.
+    const url = new URL(window.location.href);
+    if (url.searchParams.has("view")) {
+      url.searchParams.delete("view");
+      window.history.replaceState(null, "", url.pathname + url.search + url.hash);
+    }
+  }
 
   const progress = useMemo(() => (step >= 4 ? 100 : Math.round((step / 3) * 100)), [step]);
   function toggleField(value: TargetField) {
@@ -496,7 +582,7 @@ function ProfileEditor({ initial, onSaved, onLogout }: { initial: Profile; onSav
   }
 
   if (matchesOpen && profile.profile_completed) {
-    return <MatchesPage onBack={() => setMatchesOpen(false)} onLogout={onLogout} />;
+    return <MatchesPage onBack={closeMatches} onLogout={onLogout} />;
   }
 
   if (settingsOpen && profile.profile_completed) {
@@ -574,5 +660,6 @@ export default function App() {
   if (loading) return <div className="loading-screen"><Brand /><span>Finding your signal…</span></div>;
   if (!user) return <AuthPage onAuthenticated={authenticated} />;
   if (!profile) return <div className="loading-screen"><Brand /><span>Opening your profile…</span></div>;
-  return <ProfileEditor initial={profile} onSaved={setProfile} onLogout={logout} />;
+  const initialView = new URLSearchParams(window.location.search).get("view");
+  return <ProfileEditor initial={profile} onSaved={setProfile} onLogout={logout} initialView={initialView} />;
 }

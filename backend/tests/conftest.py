@@ -9,6 +9,25 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_asyn
 from app.db.models import Base, User
 
 
+@pytest.fixture(autouse=True)
+def _no_real_link_checks(monkeypatch):
+    """pipeline.match_new_postings validates each new posting's link before
+    anyone can be matched against it (see ingest/link_check.py) — a real
+    httpx call by default. Test fixtures across this suite use placeholder
+    URLs like https://example.com/1, which really resolve and can really
+    404, so without this every pipeline test would be one unmocked network
+    call away from flaking (and violate this repo's "no live network calls
+    in tests" convention — see spec: Testing). Defaults every test to
+    "everything is alive"; tests that specifically exercise link validation
+    (see test_link_check.py, test_pipeline.py's dead-link tests) override
+    this locally with their own monkeypatch."""
+
+    async def _always_alive(url, client):
+        return True
+
+    monkeypatch.setattr("app.pipeline.check_link_alive", _always_alive)
+
+
 @pytest_asyncio.fixture
 async def db_session():
     engine = create_async_engine("sqlite+aiosqlite:///:memory:")

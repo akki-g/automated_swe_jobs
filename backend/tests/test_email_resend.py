@@ -64,6 +64,22 @@ async def test_send_success_posts_expected_payload(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_send_includes_html_part_when_given(monkeypatch):
+    fake = _patch_client(monkeypatch, _FakeResponse(200))
+    provider = ResendEmailProvider(api_key="key123", from_email="alerts@example.com")
+
+    await provider.send("user@example.com", "New matches", "body text", html="<p>body</p>")
+
+    assert fake.calls[0]["json"] == {
+        "from": "alerts@example.com",
+        "to": ["user@example.com"],
+        "subject": "New matches",
+        "text": "body text",
+        "html": "<p>body</p>",
+    }
+
+
+@pytest.mark.asyncio
 async def test_send_returns_false_on_http_error(monkeypatch):
     _patch_client(monkeypatch, _FakeResponse(422))
     provider = ResendEmailProvider(api_key="key123", from_email="alerts@example.com")

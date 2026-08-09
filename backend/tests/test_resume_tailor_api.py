@@ -126,7 +126,7 @@ async def test_tailor_single_posting_returns_pdf(tailor_app):
             "/api/resume/tailor",
             headers=_csrf(client),
             files={"file": ("resume.docx", _resume_bytes(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
-            data={"posting_ids": [str(match_ids[0])]},
+            data={"match_ids": [str(match_ids[0])]},
         )
 
         assert response.status_code == 200
@@ -146,7 +146,7 @@ async def test_tailor_multiple_postings_returns_zip_with_one_pdf_each(tailor_app
             "/api/resume/tailor",
             headers=_csrf(client),
             files={"file": ("resume.docx", _resume_bytes(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
-            data={"posting_ids": [str(match_ids[0]), str(match_ids[1])]},
+            data={"match_ids": [str(match_ids[0]), str(match_ids[1])]},
         )
 
         assert response.status_code == 200
@@ -174,7 +174,7 @@ async def test_tailor_one_job_failing_does_not_block_the_others(tailor_app):
             "/api/resume/tailor",
             headers=_csrf(client),
             files={"file": ("resume.docx", _resume_bytes(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
-            data={"posting_ids": [str(match_ids[0]), str(match_ids[1])]},
+            data={"match_ids": [str(match_ids[0]), str(match_ids[1])]},
         )
 
         assert response.status_code == 200
@@ -200,7 +200,7 @@ async def test_tailor_single_failing_job_returns_502(tailor_app):
             "/api/resume/tailor",
             headers=_csrf(client),
             files={"file": ("resume.docx", _resume_bytes(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
-            data={"posting_ids": [str(match_ids[0])]},
+            data={"match_ids": [str(match_ids[0])]},
         )
 
         assert response.status_code == 502
@@ -217,7 +217,7 @@ async def test_tailor_requires_csrf(tailor_app):
         response = await client.post(
             "/api/resume/tailor",
             files={"file": ("resume.docx", _resume_bytes(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
-            data={"posting_ids": [str(match_ids[0])]},
+            data={"match_ids": [str(match_ids[0])]},
         )
 
         assert response.status_code == 403
@@ -264,7 +264,7 @@ async def test_tailor_rejects_postings_not_belonging_to_current_user(tailor_app)
             "/api/resume/tailor",
             headers=_csrf(client2),
             files={"file": ("resume.docx", _resume_bytes(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
-            data={"posting_ids": [str(other_match_id)]},
+            data={"match_ids": [str(other_match_id)]},
         )
 
         assert response.status_code == 404
@@ -282,7 +282,85 @@ async def test_tailor_rejects_malformed_resume(tailor_app):
             "/api/resume/tailor",
             headers=_csrf(client),
             files={"file": ("resume.pdf", b"not a real pdf", "application/pdf")},
-            data={"posting_ids": [str(match_ids[0])]},
+            data={"match_ids": [str(match_ids[0])]},
         )
 
         assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_tailor_resolves_by_match_id_when_id_spaces_diverge(tailor_app):
+    """Selection is by match id, and match ids drift away from posting ids
+    as soon as postings exist that this user never matched (or one posting
+    matches several users). The seeding helper above creates postings and
+    matches in lockstep, so both sequences agree there and the two id spaces
+    are indistinguishable — this seeds them deliberately apart so a lookup
+    against the wrong column resolves to the wrong job or 404s.
+    """
+    app, session_factory, _fake_client = tailor_app
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await client.post(
+            "/api/auth/signup",
+            json={"name": "Alex", "email": "alex@example.com", "password": "a-long-password", "consent": True},
+        )
+        async with session_factory() as session:
+            user = (await session.execute(select(User))).scalar_one()
+            for index in range(3):
+                session.add(
+                    PostingRow(
+                        posting_key=f"decoy-{index}",
+                        source="test",
+                        company=f"Decoy {index}",
+                        title="Unmatched role",
+                        url="https://example.com/decoy",
+                        location="Remote",
+                        role_type="new_grad",
+                        status="open",
+                        first_seen_at=datetime.now(UTC),
+                        last_seen_at=datetime.now(UTC),
+                    )
+                )
+            await session.flush()
+            wanted = PostingRow(
+                posting_key="dreamco|swe|remote",
+                source="test",
+                company="DreamCo",
+                title="New Grad SWE",
+                url="https://example.com/job",
+                location="Remote",
+                role_type="new_grad",
+                status="open",
+                first_seen_at=datetime.now(UTC),
+                last_seen_at=datetime.now(UTC),
+            )
+            session.add(wanted)
+            await session.flush()
+            match = MatchRow(
+                user_id=user.id,
+                posting_id=wanted.id,
+                score=0.9,
+                blurb="great fit",
+                priority="normal",
+                lane="slow",
+                match_reason="new_posting",
+                notified_channels=[],
+                created_at=datetime.now(UTC),
+            )
+            session.add(match)
+            await session.flush()
+            match_id, posting_id = match.id, wanted.id
+            await session.commit()
+
+        assert match_id != posting_id, "id spaces must actually diverge for this to test anything"
+
+        response = await client.post(
+            "/api/resume/tailor",
+            headers=_csrf(client),
+            files={"file": ("resume.docx", _resume_bytes(), "application/vnd.openxmlformats-officedocument.wordprocessingml.document")},
+            data={"match_ids": [str(match_id)]},
+        )
+
+        assert response.status_code == 200
+        assert "DreamCo" in response.headers["content-disposition"]

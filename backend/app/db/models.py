@@ -39,6 +39,13 @@ class User(Base):
     email_digest_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     email_digest_time: Mapped[str] = mapped_column(String(5), default="08:00")
     last_email_digest_sent_on: Mapped[date | None] = mapped_column(Date, nullable=True)
+    # When the user's current visit to the matches page began. Paired with
+    # matches_last_viewed_at (the comparison baseline, which only advances at
+    # a visit boundary) so that "New" stays stable across the many requests
+    # one visit makes — see api/matches.py::list_matches.
+    matches_visit_started_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     matches_last_viewed_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
@@ -73,7 +80,11 @@ class Posting(Base):
     __table_args__ = (UniqueConstraint("posting_key", name="uq_postings_posting_key"),)
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
-    posting_key: Mapped[str] = mapped_column(String(400), index=True)
+    # 500 comfortably covers 3 components capped at 150 chars each plus two
+    # "|" separators (see ingest/normalize.py::_MAX_COMPONENT_LENGTH) — the
+    # cap there is the real guarantee; this width is headroom, not the
+    # enforcement point.
+    posting_key: Mapped[str] = mapped_column(String(500), index=True)
     source: Mapped[str] = mapped_column(String(50))
     company: Mapped[str] = mapped_column(String(255))
     title: Mapped[str] = mapped_column(String(500))

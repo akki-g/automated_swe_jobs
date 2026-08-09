@@ -16,8 +16,8 @@ class FakeEmailProvider:
         self.success = success
         self.sent = []
 
-    async def send(self, to, subject, body):
-        self.sent.append((to, subject, body))
+    async def send(self, to, subject, body, html=None):
+        self.sent.append((to, subject, body, html))
         return self.success
 
 
@@ -63,17 +63,23 @@ async def test_email_pending_is_independent_of_prior_sms_delivery(db_session, de
 
 
 @pytest.mark.asyncio
-async def test_email_digest_is_email_only_and_reuses_uncapped_formatter():
+async def test_email_digest_is_email_only_and_reuses_curated_formatter():
     class User:
+        name = "Alex"
         email = "alex@example.com"
         email_digest_enabled = True
 
     class Match:
-        pass
+        score = 0.8
+        blurb = "Great fit"
+        priority = "normal"
+        matched_target_field = None
+        created_at = datetime.now(UTC)
 
     class Posting:
         company = "Acme"
         title = "Graduate Consultant"
+        location = "Remote"
         url = "https://example.com/job"
 
     provider = FakeEmailProvider()
@@ -82,7 +88,8 @@ async def test_email_digest_is_email_only_and_reuses_uncapped_formatter():
     assert outcome.channel == "email"
     assert outcome.send.success is True
     assert provider.sent[0][0] == "alex@example.com"
-    assert "Acme: Graduate Consultant" in provider.sent[0][2]
+    assert "Acme: Graduate Consultant" in provider.sent[0][2]  # text part
+    assert "Acme" in provider.sent[0][3]  # html part
 
 
 @pytest.mark.asyncio

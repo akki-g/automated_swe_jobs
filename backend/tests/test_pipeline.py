@@ -34,7 +34,7 @@ class FakeRankClient:
 
     async def create_message(self, *, system, messages, tools):
         keys = re.findall(r'"posting_key":\s*"([^"]+)"', messages[0]["content"])
-        results = [{"posting_key": key, "score": 0.5, "blurb": "ok"} for key in keys]
+        results = [{"posting_key": key, "score": 0.6, "blurb": "ok"} for key in keys]
         return {"content": [{"type": "tool_use", "name": tools[0]["name"], "input": {"results": results}}]}
 
 
@@ -177,6 +177,78 @@ async def test_match_new_postings_skips_posting_with_no_rank_result(db_session, 
     assert len(result2.digest_items) == 1
 
 
+class LowScoreRankClient:
+    """Scores every posting well below settings.min_match_score — simulates
+    a real but poor-fit result, distinct from EmptyRankClient's "no result
+    at all" failure case."""
+
+    def __init__(self, score: float = 0.1) -> None:
+        self.score = score
+
+    async def create_message(self, *, system, messages, tools):
+        keys = re.findall(r'"posting_key":\s*"([^"]+)"', messages[0]["content"])
+        results = [{"posting_key": key, "score": self.score, "blurb": "weak fit"} for key in keys]
+        return {"content": [{"type": "tool_use", "name": tools[0]["name"], "input": {"results": results}}]}
+
+
+@pytest.mark.asyncio
+async def test_match_new_postings_drops_result_below_min_match_score(db_session, demo_user):
+    """A real but poor-fit score must never become a stored match — this is
+    the actual bug behind 'the digest barely sent truly relevant jobs':
+    every rule-filter survivor that got ranked at all, however weak the fit,
+    used to become a permanent match."""
+    db_session.add(
+        CriteriaRow(
+            user_id=demo_user.id,
+            role_types=["new_grad"],
+            keywords=[],
+            locations=[],
+            sponsorship_required=None,
+            freeform_notes="",
+            updated_at=datetime.now(UTC),
+        )
+    )
+    await db_session.flush()
+
+    posting = _posting()
+    new_rows = await store_new_postings(db_session, [posting])
+
+    result = await match_new_postings(db_session, new_rows, LowScoreRankClient(0.1), lane="slow")
+    await db_session.commit()
+
+    assert result.instant == []
+    assert result.digest_items == []
+    assert (await db_session.execute(select(MatchRow))).scalars().all() == []
+
+
+@pytest.mark.asyncio
+async def test_match_new_postings_keeps_result_at_or_above_min_match_score(db_session, demo_user):
+    from app.config import settings
+
+    db_session.add(
+        CriteriaRow(
+            user_id=demo_user.id,
+            role_types=["new_grad"],
+            keywords=[],
+            locations=[],
+            sponsorship_required=None,
+            freeform_notes="",
+            updated_at=datetime.now(UTC),
+        )
+    )
+    await db_session.flush()
+
+    posting = _posting()
+    new_rows = await store_new_postings(db_session, [posting])
+
+    result = await match_new_postings(
+        db_session, new_rows, LowScoreRankClient(settings.min_match_score), lane="slow"
+    )
+    await db_session.commit()
+
+    assert len(result.digest_items) == 1
+
+
 @pytest.mark.asyncio
 async def test_incomplete_web_profile_is_not_ranked(db_session, demo_user):
     demo_user.password_hash = "argon2-placeholder"
@@ -235,7 +307,7 @@ async def test_match_new_postings_forces_instant_priority_for_watchlisted_compan
     posting = _posting()  # company="Acme"
     new_rows = await store_new_postings(db_session, [posting])
 
-    # FakeRankClient always scores 0.5, well below the instant threshold.
+    # FakeRankClient always scores 0.6, well below the instant threshold but above min_match_score.
     result = await match_new_postings(db_session, new_rows, FakeRankClient(), lane="fast")
     await db_session.commit()
 
@@ -257,10 +329,10 @@ class TargetFieldTaggingRankClient:
     async def create_message(self, *, system, messages, tools):
         keys = re.findall(r'"posting_key":\s*"([^"]+)"', messages[0]["content"])
         results = [
-            {"posting_key": key, "score": 0.5, "blurb": "ok", "target_field": self.target_field}
+            {"posting_key": key, "score": 0.6, "blurb": "ok", "target_field": self.target_field}
             for key in keys
             if self.target_field is not None
-        ] or [{"posting_key": key, "score": 0.5, "blurb": "ok"} for key in keys]
+        ] or [{"posting_key": key, "score": 0.6, "blurb": "ok"} for key in keys]
         return {"content": [{"type": "tool_use", "name": tools[0]["name"], "input": {"results": results}}]}
 
 
@@ -318,3 +390,131 @@ async def test_match_new_postings_leaves_matched_target_field_none_when_untagged
 
     _match_row, _posting_row = result.digest_items[0].matches[0]
     assert _match_row.matched_target_field is None
+
+
+@pytest.mark.asyncio
+async def test_match_new_postings_excludes_posting_with_dead_link(db_session, demo_user, monkeypatch):
+    """A confirmed-dead link (404/410/451) must never become a match for
+    anyone — see spec addendum: link validation, the concrete complaint
+    that users were seeing 'empty'/gone postings in their digest."""
+
+    async def _dead(url, client):
+        return False
+
+    monkeypatch.setattr("app.pipeline.check_link_alive", _dead)
+
+    db_session.add(
+        CriteriaRow(
+            user_id=demo_user.id,
+            role_types=["new_grad"],
+            keywords=[],
+            locations=[],
+            sponsorship_required=None,
+            freeform_notes="",
+            updated_at=datetime.now(UTC),
+        )
+    )
+    await db_session.flush()
+
+    posting = _posting()
+    new_rows = await store_new_postings(db_session, [posting])
+
+    result = await match_new_postings(db_session, new_rows, FakeRankClient(), lane="slow")
+    await db_session.commit()
+
+    assert result.instant == []
+    assert result.digest_items == []
+    assert (await db_session.execute(select(MatchRow))).scalars().all() == []
+
+    refreshed = (
+        await db_session.execute(select(PostingRow).where(PostingRow.posting_key == posting.posting_key))
+    ).scalar_one()
+    assert refreshed.status == "closed"
+
+
+@pytest.mark.asyncio
+async def test_match_new_postings_treats_inconclusive_link_check_as_alive(
+    db_session, demo_user, monkeypatch
+):
+    """A network error/timeout/5xx is inconclusive, not evidence the posting
+    is gone — must not block a match (fail-open, same philosophy as every
+    other source/network interaction in this codebase)."""
+
+    async def _inconclusive(url, client):
+        return None
+
+    monkeypatch.setattr("app.pipeline.check_link_alive", _inconclusive)
+
+    db_session.add(
+        CriteriaRow(
+            user_id=demo_user.id,
+            role_types=["new_grad"],
+            keywords=[],
+            locations=[],
+            sponsorship_required=None,
+            freeform_notes="",
+            updated_at=datetime.now(UTC),
+        )
+    )
+    await db_session.flush()
+
+    posting = _posting()
+    new_rows = await store_new_postings(db_session, [posting])
+
+    result = await match_new_postings(db_session, new_rows, FakeRankClient(), lane="slow")
+    await db_session.commit()
+
+    assert len(result.digest_items) == 1
+
+    refreshed = (
+        await db_session.execute(select(PostingRow).where(PostingRow.posting_key == posting.posting_key))
+    ).scalar_one()
+    assert refreshed.status == "open"
+
+
+@pytest.mark.asyncio
+async def test_match_new_postings_checks_link_once_per_posting_not_per_user(
+    db_session, monkeypatch
+):
+    """Two users both matching the same new posting must trigger exactly
+    one link check for it, not one per (user, posting) pair."""
+    from app.db.models import User as UserRow
+
+    call_count = {"n": 0}
+
+    async def _counting_alive(url, client):
+        call_count["n"] += 1
+        return True
+
+    monkeypatch.setattr("app.pipeline.check_link_alive", _counting_alive)
+
+    for email in ("alex@example.com", "sam@example.com"):
+        user = UserRow(
+            name=email,
+            email=email,
+            sms_provider="signalwire",
+            opted_out=False,
+            created_at=datetime.now(UTC),
+        )
+        db_session.add(user)
+        await db_session.flush()
+        db_session.add(
+            CriteriaRow(
+                user_id=user.id,
+                role_types=["new_grad"],
+                keywords=[],
+                locations=[],
+                sponsorship_required=None,
+                freeform_notes="",
+                updated_at=datetime.now(UTC),
+            )
+        )
+    await db_session.flush()
+
+    posting = _posting()
+    new_rows = await store_new_postings(db_session, [posting])
+
+    await match_new_postings(db_session, new_rows, FakeRankClient(), lane="slow")
+    await db_session.commit()
+
+    assert call_count["n"] == 1

@@ -46,7 +46,14 @@ RANK_TOOL = {
                         },
                         "blurb": {
                             "type": "string",
-                            "description": "One sentence, SMS-length, explaining why this posting fits.",
+                            "description": (
+                                "One sentence, SMS-length, explaining why this posting fits. When "
+                                "the posting includes a description, name specific overlapping "
+                                "skills/keywords between it and the seeker's criteria/resume "
+                                "skills (e.g. 'Python and distributed-systems experience match "
+                                "their SQL/backend focus') rather than generic praise. If no "
+                                "description was given, explain fit from title/location/field."
+                            ),
                         },
                         "target_field": {
                             "type": "string",
@@ -116,8 +123,13 @@ def _build_prompt(postings: list[Posting], criteria: Criteria) -> tuple[str, lis
         "target career fields and new-graduate or internship preferences. "
         "Use the structured resume signals as supporting evidence, while "
         "treating the seeker's explicitly selected target fields and criteria "
-        "as authoritative. Do not infer fit from protected characteristics. "
-        "Score strictly: 1.0 only for an excellent, unambiguous fit."
+        "as authoritative. When a posting's description is provided, ground the "
+        "blurb in specific, concrete skills or requirements from that description "
+        "that genuinely overlap with the seeker's keywords, resume skills, or "
+        "freeform notes — real matching terms, not generic praise like 'great fit'. "
+        "If no description is available for a posting, explain fit from its title, "
+        "location, and target field instead. Do not infer fit from protected "
+        "characteristics. Score strictly: 1.0 only for an excellent, unambiguous fit."
     )
     postings_payload = [
         {
@@ -126,6 +138,7 @@ def _build_prompt(postings: list[Posting], criteria: Criteria) -> tuple[str, lis
             "title": p.title,
             "location": p.location,
             "role_type": p.role_type.value if p.role_type else None,
+            "description": p.description,
         }
         for p in postings
     ]

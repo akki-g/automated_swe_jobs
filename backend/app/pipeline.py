@@ -5,6 +5,7 @@ import logging
 from dataclasses import dataclass
 from datetime import UTC, date, datetime, timedelta
 
+import httpx
 from sqlalchemy import or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -17,7 +18,8 @@ from app.db.models import Posting as PostingRow
 from app.db.models import User
 from app.domain.models import Criteria, Posting, Priority, RoleType, TargetField
 from app.ingest.dedupe import dedupe_postings, filter_new
-from app.ingest.normalize import normalize, normalize_company_key
+from app.ingest.link_check import check_link_alive
+from app.ingest.normalize import extract_description, normalize, normalize_company_key
 from app.matching.filters import filter_postings
 from app.matching.rank import AnthropicClient, compute_priority, rank_postings
 from app.notify.dispatch import DigestItem
@@ -169,6 +171,10 @@ def _posting_row_to_domain(row: PostingRow) -> Posting:
         role_type=RoleType(row.role_type) if row.role_type else None,
         posted_at=row.posted_at,
         raw=row.raw,
+        # Re-derived from the already-stored raw payload rather than a
+        # dedicated column — no schema change needed, and it stays correct
+        # even for postings stored before this field existed.
+        description=extract_description(row.raw),
     )
 
 
@@ -190,6 +196,41 @@ async def _rank_for_user(
     except Exception:  # noqa: BLE001 - one user's bad state must not sink the whole cycle
         logger.warning("match_new_postings: ranking failed for user_id=%s", user.id, exc_info=True)
         return []
+
+
+# Bounds how many link-liveness checks run at once. Cheap relative to a
+# ranking call (a streamed GET reading only the status line, see
+# ingest/link_check.py) so this can run higher than _RANK_CONCURRENCY —
+# checking is bounded by *new* postings this cycle, not (user, posting)
+# pairs, since a dead link is dead for everyone.
+_LINK_CHECK_CONCURRENCY = asyncio.Semaphore(20)
+_LINK_CHECK_TIMEOUT_SECONDS = 8.0
+
+
+async def _check_one_link(client: httpx.AsyncClient, row: PostingRow) -> bool | None:
+    async with _LINK_CHECK_CONCURRENCY:
+        return await check_link_alive(row.url, client)
+
+
+async def _find_dead_links(rows: list[PostingRow]) -> set[str]:
+    """Confirms which of this cycle's brand-new postings already have a
+    dead link (an unambiguous 404/410/451) before anyone can be matched
+    against them (see spec addendum: link validation — the concrete
+    complaint was users seeing 'empty'/gone job postings in their digest).
+    Checked once per posting here, not once per (user, posting) pair, since
+    many users can share the same posting and a dead link is dead for all
+    of them. Network errors, timeouts, and 5xx are inconclusive and never
+    treated as dead (see ingest/link_check.py's fail-open philosophy)."""
+    if not rows:
+        return set()
+    async with httpx.AsyncClient(timeout=_LINK_CHECK_TIMEOUT_SECONDS, follow_redirects=True) as client:
+        # return_exceptions so one unexpected failure can't cancel the whole
+        # gather and cost this cycle its link validation entirely; anything
+        # that did raise is inconclusive, i.e. not dead.
+        results = await asyncio.gather(
+            *(_check_one_link(client, row) for row in rows), return_exceptions=True
+        )
+    return {row.posting_key for row, alive in zip(rows, results) if alive is False}
 
 
 async def match_new_postings(
@@ -230,6 +271,22 @@ async def match_new_postings(
     )
     postings_domain = [_posting_row_to_domain(row) for row in new_postings]
     postings_by_key = {row.posting_key: row for row in new_postings}
+
+    try:
+        dead_keys = await _find_dead_links(new_postings)
+    except Exception:  # noqa: BLE001 - link validation must never sink the whole cycle
+        logger.warning("match_new_postings: link validation failed unexpectedly", exc_info=True)
+        dead_keys = set()
+    if dead_keys:
+        for row in new_postings:
+            if row.posting_key in dead_keys:
+                row.status = "closed"
+        logger.info(
+            "match_new_postings: %d posting(s) had a dead link (404/410/451) — excluded from matching",
+            len(dead_keys),
+        )
+        postings_domain = [p for p in postings_domain if p.posting_key not in dead_keys]
+
     now = datetime.now(UTC)
 
     instant: list[tuple[User, MatchRow, PostingRow]] = []
@@ -286,9 +343,20 @@ async def match_new_postings(
                 # are naturally re-evaluated next cycle").
                 continue
 
+            is_watched = normalize_company_key(posting.company) in watched_keys
+            if not is_watched and rank_result.score < settings.min_match_score:
+                # A real (not failed) score that's still a poor fit must
+                # never become a stored match — without this gate, every
+                # rule-filter survivor that got ranked at all (however weak
+                # the fit, e.g. 0.05) was persisted and could reach a
+                # digest, which is what actually made early digests feel
+                # irrelevant. Watchlisted companies bypass this: the user
+                # explicitly asked to hear about that company regardless of
+                # score (see spec addendum: watchlist priority).
+                continue
+
             posting_row = postings_by_key[posting.posting_key]
             priority = compute_priority(rank_result.score)
-            is_watched = normalize_company_key(posting.company) in watched_keys
             if is_watched:
                 # An explicit watchlist add is a stronger signal than the
                 # score threshold — see spec addendum: watchlist priority.

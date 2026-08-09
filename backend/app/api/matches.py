@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Annotated
 
 from fastapi import APIRouter, Depends, HTTPException, Query
@@ -17,6 +17,26 @@ router = APIRouter(prefix="/api/matches", tags=["matches"])
 
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 200
+
+# How long one "visit" to the matches page lasts for the purposes of
+# matches_last_viewed_at. Every request inside this window compares against
+# the same watermark, so browsing and filtering don't erase the user's own
+# "New" markers; the first request after it re-baselines.
+_VISIT_WINDOW = timedelta(minutes=30)
+
+
+def _as_utc(value: datetime | None) -> datetime | None:
+    """Treat a stored datetime as UTC-aware for Python-side comparisons.
+
+    PostgreSQL returns these aware (TIMESTAMPTZ), SQLite returns them naive
+    — its DATETIME type doesn't round-trip tzinfo — so comparing one against
+    datetime.now(UTC) raises on SQLite and mixing the two is exactly the
+    class of bug this endpoint already hit in production. Every writer in
+    this codebase uses datetime.now(UTC), so a naive value is UTC.
+    """
+    if value is not None and value.tzinfo is None:
+        return value.replace(tzinfo=UTC)
+    return value
 
 
 class MatchItem(BaseModel):
@@ -70,12 +90,31 @@ async def list_matches(
     and paginated (see spec: matches page). Only ever reads WHERE user_id =
     the current user — there is no cross-user access path here.
 
-    `is_new` / `new_only` are both computed against matches_last_viewed_at
-    as it was *before* this call — read that value first, then update it to
-    now at the end, so this call's own results aren't retroactively marked
-    "not new" by its own bookkeeping.
+    `is_new` / `new_only` are both computed against a baseline that is fixed
+    for the whole *visit*, not recomputed per request. The matches page
+    re-fetches on every filter change, so a per-request watermark made the
+    "New" badges vanish the moment the user touched a filter, and left
+    `new_only=true` structurally unable to match anything: opening the page
+    advanced the watermark to now, and ticking the box was the very next
+    request.
+
+    Two timestamps make that work. `matches_visit_started_at` marks when the
+    current visit began, and a request more than _VISIT_WINDOW after it
+    starts a new one. `matches_last_viewed_at` is the comparison baseline
+    and only moves at a visit boundary, to where the *previous* visit began
+    — so everything that arrived since the user was last here reads as new,
+    for every request of this visit.
     """
-    previous_viewed_at = user.matches_last_viewed_at
+    now = datetime.now(UTC)
+    visit_started_at = user.matches_visit_started_at
+    is_new_visit = (
+        _as_utc(visit_started_at) is None or now - _as_utc(visit_started_at) > _VISIT_WINDOW
+    )
+    # Stored form feeds the SQL predicate below (SQLite persists these naive,
+    # and an aware bind parameter would not compare equal there); the
+    # normalised copy feeds the Python-side comparisons.
+    previous_viewed_at = visit_started_at if is_new_visit else user.matches_last_viewed_at
+    previous_viewed_utc = _as_utc(previous_viewed_at)
 
     conditions = [MatchRow.user_id == user.id]
     if company:
@@ -109,7 +148,11 @@ async def list_matches(
 
     rows = (
         await session.execute(
-            base_query.order_by(MatchRow.created_at.desc(), MatchRow.id.desc())
+            # Relevance-first by default (score desc) rather than newest-first
+            # — a mediocre new match shouldn't bury a great older one. Filters
+            # above are unaffected; this only changes default ordering within
+            # whatever set of matches survives them.
+            base_query.order_by(MatchRow.score.desc(), MatchRow.created_at.desc(), MatchRow.id.desc())
             .limit(limit)
             .offset(offset)
         )
@@ -130,13 +173,21 @@ async def list_matches(
             matched_target_field=match_row.matched_target_field,
             saved=match_row.saved,
             created_at=match_row.created_at,
-            is_new=previous_viewed_at is None or match_row.created_at > previous_viewed_at,
+            is_new=(
+                previous_viewed_utc is None
+                or _as_utc(match_row.created_at) > previous_viewed_utc
+            ),
         )
         for match_row, posting_row in rows
     ]
 
-    user.matches_last_viewed_at = datetime.now(UTC)
-    await session.commit()
+    if is_new_visit:
+        # Only at a visit boundary: carry the baseline forward to where the
+        # previous visit began, and open a new one. Requests within this
+        # visit leave both untouched, so their results stay consistent.
+        user.matches_last_viewed_at = previous_viewed_at
+        user.matches_visit_started_at = now
+        await session.commit()
 
     return MatchListResponse(items=items, total=total)
 

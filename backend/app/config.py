@@ -23,6 +23,9 @@ class Settings(BaseSettings):
     auth_session_hours: int = 24 * 7
     auth_cookie_secure: bool = False
     frontend_origins: str = "http://localhost:5173,http://127.0.0.1:5173"
+    # The user-facing web app's own URL (not an API origin) — used to link
+    # back to the matches page from notification emails.
+    frontend_app_url: str = "http://localhost:5173"
 
     anthropic_api_key: str = ""
 
@@ -49,6 +52,18 @@ class Settings(BaseSettings):
     scheduler_timezone: str = "America/New_York"
     stale_after_cycles: int = 4
     digest_max_sms_matches: int = 8
+    digest_max_email_matches: int = 15
+    # A ranked survivor scoring below this never becomes a stored `matches`
+    # row at all (see pipeline.match_new_postings) — without this gate,
+    # every rule-filter survivor that got ranked at all (even a 0.05, an
+    # obviously poor fit) was persisted as a "match" and could reach a
+    # digest, which is what actually made early digests feel irrelevant.
+    min_match_score: float = 0.55
+    # Per-company cap applied when curating a digest (see
+    # notify/dispatch.py::_curate_matches) — a single prolific company
+    # posting many similar roles must not crowd out every other company's
+    # matches in one email/SMS digest.
+    digest_max_per_company: int = 2
     high_priority_score_threshold: float = 0.9
 
     @property

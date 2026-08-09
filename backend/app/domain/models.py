@@ -60,6 +60,14 @@ class Posting:
     role_type: RoleType | None
     posted_at: datetime | None
     raw: dict = field(default_factory=dict)
+    # A short, plain-text excerpt of the job's own description, extracted
+    # from `raw` where the source provides one (see
+    # ingest/normalize.py::extract_description) — not every source has one
+    # (Workday's list endpoint, GitHub lists, RSS feeds don't), so this is
+    # commonly None. Feeding this to the ranking prompt is what lets
+    # rank.py's blurb cite specific skills/keywords the posting actually
+    # asks for, instead of only ever reasoning from title/location.
+    description: str | None = None
 
 
 @dataclass(frozen=True)

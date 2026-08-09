@@ -42,6 +42,11 @@ def get_tailor_client() -> TailorClient:
 
 @dataclass
 class _JobResult:
+    # Both ids are reported: `match_id` is what the client selected and sent,
+    # `posting_id` is the job it resolved to. They are different id spaces —
+    # conflating them is what previously made this endpoint tailor against
+    # the wrong posting (or 404) once the two sequences diverged.
+    match_id: int
     posting_id: int
     company: str
     title: str
@@ -56,7 +61,11 @@ def _safe_filename(company: str, title: str) -> str:
 
 
 async def _build_one(
-    resume_text: str, contact_name: str, posting_row: PostingRow, client: TailorClient
+    resume_text: str,
+    contact_name: str,
+    match_id: int,
+    posting_row: PostingRow,
+    client: TailorClient,
 ) -> _JobResult:
     async with _TAILOR_CONCURRENCY:
         try:
@@ -72,6 +81,7 @@ async def _build_one(
         except LatexCompileError:
             logger.warning("resume tailoring: LaTeX compile failed for posting_id=%s", posting_row.id, exc_info=True)
             return _JobResult(
+                match_id=match_id,
                 posting_id=posting_row.id,
                 company=posting_row.company,
                 title=posting_row.title,
@@ -81,6 +91,7 @@ async def _build_one(
         except Exception:  # noqa: BLE001 - one job's failure must not sink the whole request
             logger.warning("resume tailoring: failed for posting_id=%s", posting_row.id, exc_info=True)
             return _JobResult(
+                match_id=match_id,
                 posting_id=posting_row.id,
                 company=posting_row.company,
                 title=posting_row.title,
@@ -88,6 +99,7 @@ async def _build_one(
                 error="Could not generate a tailored resume for this posting",
             )
     return _JobResult(
+        match_id=match_id,
         posting_id=posting_row.id,
         company=posting_row.company,
         title=posting_row.title,
@@ -102,15 +114,22 @@ async def tailor_resume(
     session: Annotated[AsyncSession, Depends(get_db_session)],
     client: Annotated[TailorClient, Depends(get_tailor_client)],
     file: UploadFile,
-    posting_ids: Annotated[list[int], Form()],
+    match_ids: Annotated[list[int], Form()],
 ) -> Response:
-    """One tailored PDF per selected posting — never the same document
+    """One tailored PDF per selected match — never the same document
     blended across postings (see spec: Resume tailoring, selection
     semantics). The uploaded resume is parsed to text in memory for this
     request only and is never persisted, matching the profile-resume
-    upload's minimization policy."""
-    posting_ids = list(dict.fromkeys(posting_ids))[:MAX_POSTINGS_PER_REQUEST]
-    if not posting_ids:
+    upload's minimization policy.
+
+    Selection is by **match id**, which is what the matches list renders and
+    therefore the only id the client holds (MatchItem.id — see
+    api/matches.py). Filtering on Match.posting_id instead silently resolved
+    to a different job whenever the two id sequences had drifted apart,
+    which they do as soon as one posting matches more than one user.
+    """
+    match_ids = list(dict.fromkeys(match_ids))[:MAX_POSTINGS_PER_REQUEST]
+    if not match_ids:
         raise HTTPException(status_code=422, detail="Select at least one posting")
 
     data = await file.read(MAX_RESUME_BYTES + 1)
@@ -124,15 +143,17 @@ async def tailor_resume(
         await session.execute(
             select(MatchRow, PostingRow)
             .join(PostingRow, MatchRow.posting_id == PostingRow.id)
-            .where(MatchRow.user_id == user.id, MatchRow.posting_id.in_(posting_ids))
+            .where(MatchRow.user_id == user.id, MatchRow.id.in_(match_ids))
         )
     ).all()
     if not rows:
         raise HTTPException(status_code=404, detail="None of the selected postings were found")
 
-    posting_rows = [posting_row for _match_row, posting_row in rows]
     results = await asyncio.gather(
-        *(_build_one(resume_text, user.name, posting_row, client) for posting_row in posting_rows)
+        *(
+            _build_one(resume_text, user.name, match_row.id, posting_row, client)
+            for match_row, posting_row in rows
+        )
     )
 
     if len(results) == 1:
@@ -154,6 +175,7 @@ async def tailor_resume(
         for result in results:
             manifest.append(
                 {
+                    "match_id": result.match_id,
                     "posting_id": result.posting_id,
                     "company": result.company,
                     "title": result.title,

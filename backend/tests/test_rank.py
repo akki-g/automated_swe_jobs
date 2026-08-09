@@ -186,6 +186,24 @@ def test_ranking_prompt_uses_target_fields_and_structured_resume_signals():
     assert '"skills": ["market sizing"]' in messages[0]["content"]
 
 
+def test_ranking_prompt_includes_posting_description_and_instructs_citing_matches():
+    posting = _posting(description="Requires Python, SQL, and distributed systems experience.")
+    criteria = Criteria(user_id=1, keywords=("Python",))
+
+    system, messages = _build_prompt([posting], criteria)
+
+    assert "genuinely overlap" in system
+    assert "Requires Python, SQL, and distributed systems experience." in messages[0]["content"]
+
+
+def test_ranking_prompt_sends_null_description_when_source_has_none():
+    posting = _posting(description=None)
+
+    _system, messages = _build_prompt([posting], Criteria(user_id=1))
+
+    assert '"description": null' in messages[0]["content"]
+
+
 @pytest.mark.asyncio
 async def test_rank_postings_persists_valid_target_field_tag():
     postings = [_posting(posting_key="k1")]
