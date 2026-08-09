@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import io
+import json
+from types import SimpleNamespace
 
 import pytest
 from pypdf import PdfReader
@@ -8,214 +10,376 @@ from pypdf import PdfReader
 from app.resume.compile_pdf import LatexCompileError, compile_latex_to_pdf
 from app.resume.latex_template import escape_latex, render_latex
 from app.resume.tailor import (
-    EducationEntry,
-    ExperienceEntry,
+    ClaudeTailorClient,
+    ResumeEntry,
+    ResumeSection,
     TailoredResumeContent,
     normalize_tailored_content,
+    parse_resume_structure,
     tailor_resume_content,
 )
 
-
-class FakeTailorClient:
-    def __init__(self, tool_input: dict) -> None:
-        self.tool_input = tool_input
-        self.calls = 0
-        self.last_message: str | None = None
-        self.last_system: str | None = None
-
-    async def create_message(self, *, system, messages, tools):
-        self.calls += 1
-        self.last_system = system
-        self.last_message = messages[0]["content"]
-        return {"content": [{"type": "tool_use", "name": tools[0]["name"], "input": self.tool_input}]}
-
-
-class FailingTailorClient:
-    async def create_message(self, *, system, messages, tools):
-        raise RuntimeError("boom")
-
-
-SAMPLE_PAYLOAD = {
-    "summary": "Backend-focused CS student.",
-    "skills": ["Python", "python", "SQL", "x" * 100],
-    "experience": [
+PARSED_PAYLOAD = {
+    "name": "Alex Morgan",
+    "contact": {
+        "email": "alex@example.com",
+        "phone": "555-0100",
+        "location": "Orlando, FL",
+        "links": ["github.com/alex"],
+    },
+    "sections": [
         {
-            "title": "SWE Intern",
-            "organization": "Acme",
-            "dates": "Summer 2025",
-            "bullets": ["Shipped a feature", "Fixed bugs"],
+            "heading": "Experience",
+            "kind": "experience",
+            "raw_text": "SWE Intern — Acme — 2025. Shipped a distributed Python service.",
+            "items": [],
+            "entries": [],
         },
-        {"title": "", "organization": "Missing title, should be dropped", "bullets": []},
+        {
+            "heading": "Publications",
+            "kind": "publications",
+            "raw_text": "Graph Learning for Coordinated Agents, 2026.",
+            "items": ["Graph Learning for Coordinated Agents, 2026"],
+            "entries": [],
+        },
     ],
-    "education": [{"school": "State University", "detail": "B.S. CS"}],
+    "unassigned_text": [],
+}
+
+TAILORED_PAYLOAD = {
+    "headline": "Machine Learning Platform Engineer",
+    "contact": {
+        "email": "alex@example.com",
+        "phone": "555–0100",
+        "location": "Orlando, FL",
+        "links": ["github.com/alex"],
+    },
+    "sections": [
+        {
+            "heading": "Summary",
+            "kind": "summary",
+            "intro": "Backend engineer building distributed ML systems.",
+            "items": [],
+            "entries": [],
+        },
+        {
+            "heading": "Technical Skills",
+            "kind": "skills",
+            "intro": "",
+            "items": ["Python", "Go", "Kafka", "PyTorch"],
+            "entries": [],
+        },
+        {
+            "heading": "Experience",
+            "kind": "experience",
+            "intro": "",
+            "items": [],
+            "entries": [
+                {
+                    "title": "Software Engineering Intern",
+                    "subtitle": "Acme & Co",
+                    "location": "Orlando, FL",
+                    "dates": "May–Aug 2025",
+                    "body": "Core Platform Team",
+                    "bullets": [
+                        "Shipped a distributed Python service processing 2M events/day.",
+                        "Raised automated test coverage from 40% to 80%.",
+                    ],
+                }
+            ],
+        },
+        {
+            "heading": "Projects",
+            "kind": "projects",
+            "intro": "",
+            "items": [],
+            "entries": [
+                {
+                    "title": "CitePilot",
+                    "subtitle": "Independent Project",
+                    "location": "",
+                    "dates": "2026",
+                    "body": "",
+                    "bullets": ["Combined pgvector and Neo4j retrieval using reciprocal rank fusion."],
+                }
+            ],
+        },
+        {
+            "heading": "Publications",
+            "kind": "publications",
+            "intro": "",
+            "items": ["Graph Learning for Coordinated Agents, 2026"],
+            "entries": [],
+        },
+        {
+            "heading": "Education",
+            "kind": "education",
+            "intro": "",
+            "items": [],
+            "entries": [
+                {
+                    "title": "University of Central Florida",
+                    "subtitle": "B.S. Computer Science & B.S. Statistics",
+                    "location": "Orlando, FL",
+                    "dates": "Expected 2027",
+                    "body": "GPA: 3.7",
+                    "bullets": [],
+                }
+            ],
+        },
+    ],
 }
 
 
-@pytest.mark.asyncio
-async def test_tailor_resume_content_calls_client_with_resume_and_posting():
-    client = FakeTailorClient(SAMPLE_PAYLOAD)
+class FakeTailorClient:
+    def __init__(self) -> None:
+        self.parse_calls: list[str] = []
+        self.rewrite_calls: list[dict] = []
 
-    content = await tailor_resume_content(
-        "Python and SQL experience.",
-        company="Acme",
-        title="New Grad SWE",
-        location="Remote",
-        client=client,
-    )
+    async def parse_resume(self, resume_text: str) -> dict:
+        self.parse_calls.append(resume_text)
+        return PARSED_PAYLOAD
 
-    assert client.calls == 1
-    assert "Acme" in client.last_message
-    assert "New Grad SWE" in client.last_message
-    assert content.summary == "Backend-focused CS student."
-
-
-@pytest.mark.asyncio
-async def test_tailor_resume_content_uses_job_description_and_rejects_meta_commentary():
-    client = FakeTailorClient(SAMPLE_PAYLOAD)
-
-    await tailor_resume_content(
-        "Python and SQL experience.",
-        company="Acme",
-        title="New Grad SWE",
-        location="Remote",
-        description="Build distributed Python services and data pipelines.",
-        client=client,
-    )
-
-    assert "Build distributed Python services" in client.last_message
-    assert "Never use meta-commentary" in client.last_system
+    async def rewrite_resume(
+        self, parsed_resume, *, company, title, location, description, job_url
+    ) -> dict:
+        self.rewrite_calls.append(
+            {
+                "parsed_resume": parsed_resume,
+                "company": company,
+                "title": title,
+                "location": location,
+                "description": description,
+                "job_url": job_url,
+            }
+        )
+        return TAILORED_PAYLOAD
 
 
-@pytest.mark.asyncio
-async def test_tailor_resume_content_propagates_client_failure():
-    with pytest.raises(RuntimeError):
-        await tailor_resume_content(
-            "resume text", company="Acme", title="SWE", location=None, client=FailingTailorClient()
+class FailingTailorClient(FakeTailorClient):
+    async def rewrite_resume(self, *args, **kwargs):
+        raise RuntimeError("boom")
+
+
+class RecordingMessages:
+    def __init__(self) -> None:
+        self.calls: list[dict] = []
+
+    async def create(self, **kwargs):
+        self.calls.append(kwargs)
+        if kwargs["model"] == "parser-model":
+            payload = PARSED_PAYLOAD
+        elif "tools" in kwargs:
+            return SimpleNamespace(
+                content=[SimpleNamespace(type="text", text="Official role keywords: Python, Kafka")]
+            )
+        else:
+            payload = TAILORED_PAYLOAD
+        return SimpleNamespace(
+            content=[SimpleNamespace(type="text", text=json.dumps(payload))]
         )
 
 
-def test_normalize_tailored_content_bounds_and_dedupes_skills():
-    result = normalize_tailored_content(SAMPLE_PAYLOAD)
+@pytest.mark.asyncio
+async def test_anthropic_client_uses_haiku_schema_then_sonnet_search_and_rewrite():
+    messages = RecordingMessages()
+    client = object.__new__(ClaudeTailorClient)
+    client._client = SimpleNamespace(messages=messages)
+    client._parser_model = "parser-model"
+    client._writer_model = "writer-model"
 
-    assert result.skills == ("Python", "SQL", "x" * 39 + "…")
-    assert len(result.experience) == 1  # entry missing a title is dropped
-    assert result.experience[0].title == "SWE Intern"
-    assert result.education[0].school == "State University"
+    parsed = await client.parse_resume("Complete source resume")
+    rewritten = await client.rewrite_resume(
+        parsed,
+        company="Acme",
+        title="ML Platform Engineer",
+        location="Remote",
+        description="Build Python and Kafka services.",
+        job_url="https://example.com/jobs/1",
+    )
+
+    parse_call, research_call, rewrite_call = messages.calls
+    assert parse_call["model"] == "parser-model"
+    assert parse_call["output_config"]["format"]["type"] == "json_schema"
+    assert [tool["name"] for tool in research_call["tools"]] == ["web_search", "web_fetch"]
+    assert research_call["model"] == "writer-model"
+    assert rewrite_call["model"] == "writer-model"
+    assert rewrite_call["output_config"]["format"]["type"] == "json_schema"
+    rewrite_prompt = rewrite_call["messages"][0]["content"]
+    assert "Official role keywords: Python, Kafka" in rewrite_prompt
+    assert "Graph Learning for Coordinated Agents" in rewrite_prompt
+    assert rewritten["headline"] == "Machine Learning Platform Engineer"
+
+
+@pytest.mark.asyncio
+async def test_small_model_parse_preserves_generic_sections():
+    client = FakeTailorClient()
+
+    parsed = await parse_resume_structure("Full resume text", client=client)
+
+    assert client.parse_calls == ["Full resume text"]
+    assert [section["heading"] for section in parsed["sections"]] == [
+        "Experience",
+        "Publications",
+    ]
+    assert "Graph Learning" in parsed["sections"][1]["raw_text"]
+
+
+@pytest.mark.asyncio
+async def test_writer_receives_lossless_resume_and_complete_posting_context():
+    client = FakeTailorClient()
+
+    content = await tailor_resume_content(
+        PARSED_PAYLOAD,
+        company="Acme",
+        title="New Grad ML Platform Engineer",
+        location="Remote",
+        description="Build Python data infrastructure.",
+        job_url="https://example.com/job",
+        client=client,
+    )
+
+    call = client.rewrite_calls[0]
+    assert call["parsed_resume"] is PARSED_PAYLOAD
+    assert call["description"] == "Build Python data infrastructure."
+    assert call["job_url"] == "https://example.com/job"
+    assert content.headline == "Machine Learning Platform Engineer"
+    assert [section.heading for section in content.sections] == [
+        "Summary",
+        "Technical Skills",
+        "Experience",
+        "Projects",
+        "Publications",
+        "Education",
+    ]
+
+
+@pytest.mark.asyncio
+async def test_tailor_resume_content_propagates_writer_failure():
+    with pytest.raises(RuntimeError):
+        await tailor_resume_content(
+            PARSED_PAYLOAD,
+            company="Acme",
+            title="SWE",
+            location=None,
+            description=None,
+            job_url=None,
+            client=FailingTailorClient(),
+        )
+
+
+def test_normalize_tailored_content_keeps_custom_sections_and_full_entries():
+    result = normalize_tailored_content(TAILORED_PAYLOAD)
+
+    publications = next(section for section in result.sections if section.kind == "publications")
+    experience = next(section for section in result.sections if section.kind == "experience")
+    assert publications.items == ("Graph Learning for Coordinated Agents, 2026",)
+    assert experience.entries[0].subtitle == "Acme & Co"
+    assert len(experience.entries[0].bullets) == 2
 
 
 def test_normalize_tailored_content_handles_missing_fields_gracefully():
     result = normalize_tailored_content({})
 
-    assert result.summary == ""
-    assert result.skills == ()
-    assert result.experience == ()
-    assert result.education == ()
+    assert result.headline == ""
+    assert result.sections == ()
 
 
-def test_escape_latex_neutralizes_special_characters():
-    escaped = escape_latex("100% & $5 back_slash {test} ~tilde^caret\\end")
+def test_escape_latex_neutralizes_special_characters_and_unicode():
+    escaped = escape_latex("100% & $5 back_slash {test} — May–Aug · done")
 
-    assert "%" not in escaped.replace(r"\%", "")
     assert r"\&" in escaped
     assert r"\$" in escaped
     assert r"\_" in escaped
     assert r"\{" in escaped and r"\}" in escaped
+    assert "---" in escaped and "May--Aug" in escaped
+    assert r"\textperiodcentered{}" in escaped
 
 
-def _content(**overrides) -> TailoredResumeContent:
-    defaults = dict(
-        summary="A tailored summary.",
-        skills=("Python", "SQL"),
-        experience=(
-            ExperienceEntry(
-                title="SWE Intern", organization="Acme", dates="2025", bullets=("Did a thing",)
-            ),
-        ),
-        education=(EducationEntry(school="State University", detail="B.S. CS"),),
-    )
-    defaults.update(overrides)
-    return TailoredResumeContent(**defaults)
+def _content() -> TailoredResumeContent:
+    return normalize_tailored_content(TAILORED_PAYLOAD)
 
 
-def test_render_latex_produces_compilable_document_with_special_characters():
-    content = _content(
-        summary="Improved throughput by 50% & cut costs $5k.",
-        experience=(
-            ExperienceEntry(
-                title="SWE Intern",
-                organization="Acme & Co",
-                dates="2025",
-                bullets=("Fixed a #1 bug worth 10%",),
-            ),
-        ),
-    )
-
-    tex = render_latex(content, contact_name="Alex O'Brien & Co")
-
-    assert r"\&" in tex
-    assert r"\%" in tex
-    assert r"\$" in tex
-    assert r"\#" in tex
-
-
-def test_render_latex_keeps_commands_for_skill_separators_and_normalizes_unicode():
+def test_render_latex_renders_every_preserved_section_and_real_separators():
     tex = render_latex(
-        _content(skills=("Python", "Go")),
+        _content(),
         contact_name="Alex Morgan",
         contact_email="alex@example.com",
         contact_phone="555–0100",
     )
 
+    assert all(f"\\ressection{{{heading}}}" in tex for heading in (
+        "SUMMARY",
+        "TECHNICAL SKILLS",
+        "EXPERIENCE",
+        "PROJECTS",
+        "PUBLICATIONS",
+        "EDUCATION",
+    ))
     assert r"Python \enspace\textcolor{accent}{\textbullet}\enspace Go" in tex
     assert r"\textbackslash{}textbullet" not in tex
     assert "555--0100" in tex
+    assert r"Acme \& Co" in tex
 
 
 @pytest.mark.asyncio
-async def test_compile_latex_to_pdf_produces_real_pdf_bytes():
-    tex = render_latex(_content(), contact_name="Alex Morgan")
-
-    pdf_bytes = await compile_latex_to_pdf(tex)
-
-    assert pdf_bytes.startswith(b"%PDF-")
-
-
-@pytest.mark.asyncio
-async def test_bounded_full_resume_compiles_to_one_page():
-    bullet = (
-        "Designed reliable distributed services and machine-learning data pipelines, "
-        "improving production performance and operational visibility with measured impact."
-    )
-    content = _content(
-        summary=(
-            "Software engineer building reliable distributed systems and applied machine-learning "
-            "infrastructure. Experienced with backend services, data platforms, and CI/CD."
-        ),
-        skills=tuple(f"Relevant technical skill {index}" for index in range(16)),
-        experience=tuple(
-            ExperienceEntry(
-                title=f"Software Engineering Role {index}",
-                organization=f"Engineering and Research Organization {index}",
-                dates="Jan 2024–Present",
-                bullets=(bullet, bullet, bullet),
-            )
-            for index in range(4)
-        ),
-        education=(
-            EducationEntry("State University", "B.S. Computer Science · Expected 2027 · GPA 3.7"),
-            EducationEntry("Technical College", "Certificate in Data Systems"),
-        ),
-    )
-
+async def test_rich_multisection_resume_compiles_and_remains_searchable():
     pdf_bytes = await compile_latex_to_pdf(
         render_latex(
-            content,
+            _content(),
             contact_name="Alex Morgan",
             contact_email="alex@example.com",
             contact_phone="(555) 010-1000",
         )
     )
 
+    reader = PdfReader(io.BytesIO(pdf_bytes))
+    extracted = "\n".join(page.extract_text() or "" for page in reader.pages)
+    assert pdf_bytes.startswith(b"%PDF-")
+    assert "PROJECTS" in extracted
+    assert "PUBLICATIONS" in extracted
+    assert "Graph Learning for Coordinated Agents" in extracted
+
+
+@pytest.mark.asyncio
+async def test_dense_resume_uses_compact_layout_without_truncation_or_overflow_page():
+    bullet = (
+        "Designed distributed machine-learning platform services with production monitoring, "
+        "failure isolation, automated testing, and measurable improvements across data pipelines."
+    )
+    dense_entries = tuple(
+        ResumeEntry(
+            title=f"Engineering and Research Role {index}",
+            subtitle=f"Organization {index}",
+            location="Orlando, FL",
+            dates="2024–Present",
+            body="Platform and Applied ML Team",
+            bullets=tuple(bullet for _ in range(count)),
+        )
+        for index, count in enumerate((5, 3, 4, 3, 3))
+    )
+    complete_skills = (
+        "Systems & Data: FastAPI, REST APIs, Kafka, PostgreSQL/pgvector, MongoDB, Redis, "
+        "Neo4j, HDFS/HBase, PostGIS, GraphDB, SQLAlchemy, DB2, InfluxDB"
+    )
+    content = TailoredResumeContent(
+        headline="Machine Learning Platform Engineer",
+        contact_email="alex@example.com",
+        contact_phone="555-0100",
+        contact_location="Orlando, FL",
+        contact_links=("github.com/alex",),
+        sections=(
+            ResumeSection("Technical Skills", "skills", "", (complete_skills,), ()),
+            ResumeSection("Experience", "experience", "", (), dense_entries[:3]),
+            ResumeSection("Projects", "projects", "", (), dense_entries[3:]),
+        ),
+    )
+
+    tex = render_latex(content, contact_name="Alex Morgan")
+    pdf_bytes = await compile_latex_to_pdf(tex)
+
+    assert r"\fontsize{8.45}{9.35}\selectfont" in tex
+    assert "InfluxDB" in tex
     assert len(PdfReader(io.BytesIO(pdf_bytes)).pages) == 1
 
 

@@ -22,7 +22,12 @@ from app.ingest.normalize import extract_description
 from app.resume.compile_pdf import LatexCompileError, compile_latex_to_pdf
 from app.resume.latex_template import render_latex
 from app.resume.parse import MAX_RESUME_BYTES, ResumeParseError, extract_resume_text
-from app.resume.tailor import ClaudeTailorClient, TailorClient, tailor_resume_content
+from app.resume.tailor import (
+    ClaudeTailorClient,
+    TailorClient,
+    parse_resume_structure,
+    tailor_resume_content,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +67,7 @@ def _safe_filename(company: str, title: str) -> str:
 
 
 async def _build_one(
-    resume_text: str,
+    parsed_resume: dict,
     contact_name: str,
     contact_email: str | None,
     contact_phone: str | None,
@@ -73,11 +78,12 @@ async def _build_one(
     async with _TAILOR_CONCURRENCY:
         try:
             content = await tailor_resume_content(
-                resume_text,
+                parsed_resume,
                 company=posting_row.company,
                 title=posting_row.title,
                 location=posting_row.location,
                 description=extract_description(posting_row.raw),
+                job_url=posting_row.url,
                 client=client,
             )
             tex = render_latex(
@@ -158,10 +164,18 @@ async def tailor_resume(
     if not rows:
         raise HTTPException(status_code=404, detail="None of the selected postings were found")
 
+    # The cheap, lossless parsing pass is shared by every selected posting.
+    # Only the job-specific Sonnet research/rewrite work runs per posting.
+    try:
+        parsed_resume = await parse_resume_structure(resume_text, client=client)
+    except Exception as exc:  # noqa: BLE001 - expose a stable API error, not provider internals
+        logger.warning("resume tailoring: structured resume parsing failed", exc_info=True)
+        raise HTTPException(status_code=502, detail="Could not understand the uploaded resume") from exc
+
     results = await asyncio.gather(
         *(
             _build_one(
-                resume_text,
+                parsed_resume,
                 user.name,
                 user.email,
                 user.phone,

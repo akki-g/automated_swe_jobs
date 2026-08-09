@@ -20,13 +20,42 @@ from app.db.models import Posting as PostingRow
 from app.db.models import User
 from sqlalchemy import select
 
-SAMPLE_TOOL_INPUT = {
-    "summary": "A tailored summary.",
-    "skills": ["Python", "SQL"],
-    "experience": [
-        {"title": "SWE Intern", "organization": "Acme", "dates": "2025", "bullets": ["Did a thing"]}
+PARSED_RESUME = {
+    "name": "Alex",
+    "contact": {"email": "alex@example.com", "phone": "", "location": "", "links": []},
+    "sections": [
+        {
+            "heading": "Experience",
+            "kind": "experience",
+            "raw_text": "SWE Intern, Acme, 2025. Did a thing.",
+            "items": [],
+            "entries": [],
+        }
     ],
-    "education": [{"school": "State University", "detail": "B.S. CS"}],
+    "unassigned_text": [],
+}
+
+TAILORED_RESUME = {
+    "headline": "Backend Software Engineer",
+    "contact": {"email": "alex@example.com", "phone": "", "location": "", "links": []},
+    "sections": [
+        {
+            "heading": "Experience",
+            "kind": "experience",
+            "intro": "",
+            "items": [],
+            "entries": [
+                {
+                    "title": "SWE Intern",
+                    "subtitle": "Acme",
+                    "location": "",
+                    "dates": "2025",
+                    "body": "",
+                    "bullets": ["Did a thing"],
+                }
+            ],
+        }
+    ],
 }
 
 
@@ -34,12 +63,19 @@ class FakeTailorClient:
     def __init__(self, fail_for_company: str | None = None) -> None:
         self.fail_for_company = fail_for_company
         self.calls: list[str] = []
+        self.parse_calls = 0
 
-    async def create_message(self, *, system, messages, tools):
-        self.calls.append(messages[0]["content"])
-        if self.fail_for_company and self.fail_for_company in messages[0]["content"]:
+    async def parse_resume(self, resume_text: str):
+        self.parse_calls += 1
+        return PARSED_RESUME
+
+    async def rewrite_resume(
+        self, parsed_resume, *, company, title, location, description, job_url
+    ):
+        self.calls.append(company)
+        if self.fail_for_company and self.fail_for_company == company:
             raise RuntimeError("simulated failure")
-        return {"content": [{"type": "tool_use", "name": tools[0]["name"], "input": SAMPLE_TOOL_INPUT}]}
+        return TAILORED_RESUME
 
 
 def _resume_bytes() -> bytes:
@@ -136,7 +172,7 @@ async def test_tailor_single_posting_returns_pdf(tailor_app):
 
 @pytest.mark.asyncio
 async def test_tailor_multiple_postings_returns_zip_with_one_pdf_each(tailor_app):
-    app, session_factory, _fake_client = tailor_app
+    app, session_factory, fake_client = tailor_app
     async with httpx.AsyncClient(
         transport=httpx.ASGITransport(app=app), base_url="http://test"
     ) as client:
@@ -159,6 +195,8 @@ async def test_tailor_multiple_postings_returns_zip_with_one_pdf_each(tailor_app
             assert archive.read(name).startswith(b"%PDF-")
         manifest = json.loads(archive.read("results.json"))
         assert all(item["status"] == "ok" for item in manifest)
+        assert fake_client.parse_calls == 1
+        assert set(fake_client.calls) == {"Acme", "Beta Corp"}
 
 
 @pytest.mark.asyncio
