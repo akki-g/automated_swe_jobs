@@ -474,3 +474,38 @@ async def gather_pending_digests(
             by_user.setdefault(user.id, DigestItem(user=user, matches=[]))
 
     return list(by_user.values())
+
+
+async def gather_previously_sent_email_matches(
+    session: AsyncSession, user_ids: list[int]
+) -> dict[int, list[tuple[MatchRow, PostingRow]]]:
+    """Matches already delivered by email before, for users about to get
+    another one — the "For You" pool (see spec addendum: email digest
+    sections, notify/curate.py::curate_two_section_digest). Excludes
+    postings link validation has since marked closed, and bounded to the
+    last `digest_for_you_max_age_days` so this doesn't grow into resurfacing
+    arbitrarily old matches forever as a user's history accumulates.
+
+    Mutually exclusive with gather_pending_digests(channel="email")'s
+    result by construction: a match is either not yet emailed (pending) or
+    already emailed (this function), never both.
+    """
+    if not user_ids:
+        return {}
+    cutoff = datetime.now(UTC) - timedelta(days=settings.digest_for_you_max_age_days)
+    rows = (
+        await session.execute(
+            select(MatchRow, PostingRow)
+            .join(PostingRow, MatchRow.posting_id == PostingRow.id)
+            .where(
+                MatchRow.user_id.in_(user_ids),
+                PostingRow.status != "closed",
+                MatchRow.created_at >= cutoff,
+            )
+        )
+    ).all()
+    by_user: dict[int, list[tuple[MatchRow, PostingRow]]] = {user_id: [] for user_id in user_ids}
+    for match_row, posting_row in rows:
+        if "email" in (match_row.notified_channels or []):
+            by_user[match_row.user_id].append((match_row, posting_row))
+    return by_user

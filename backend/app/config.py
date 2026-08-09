@@ -64,6 +64,15 @@ class Settings(BaseSettings):
     # posting many similar roles must not crowd out every other company's
     # matches in one email/SMS digest.
     digest_max_per_company: int = 2
+    # The email digest's "Just Dropped" section (matches never emailed
+    # before) is capped independent of the overall cap — the rest of
+    # digest_max_email_matches is filled by "For You" (matches a previous
+    # email already showed, still open/relevant). See notify/curate.py.
+    digest_max_just_dropped: int = 5
+    # How far back a previously-emailed match can still surface in "For
+    # You" — bounds that section from resurfacing arbitrarily old matches
+    # forever as a user's history grows.
+    digest_for_you_max_age_days: int = 14
     high_priority_score_threshold: float = 0.9
 
     @property

@@ -522,3 +522,84 @@ async def test_resend_email_ignores_another_users_matches(web_app):
 
         assert response.json()["match_count"] == 0
         assert "Other Co" not in fake_email.sent[0][2]
+
+
+@pytest.mark.asyncio
+async def test_resend_email_marks_just_dropped_delivered_so_it_never_repeats(web_app):
+    """A never-before-emailed match shown in "Just Dropped" must not appear
+    in "Just Dropped" again on a second resend — the exact "should not be
+    repeated in different emails" requirement."""
+    app, session_factory, fake_email = web_app
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await _signup(client, "alex@example.com")
+        user_id = await _get_user_id(session_factory)
+        await _seed_posting_and_match(session_factory, user_id=user_id, company="Acme")
+
+        first = await client.post("/api/matches/resend-email", headers=_csrf(client))
+        second = await client.post("/api/matches/resend-email", headers=_csrf(client))
+
+        assert first.json()["match_count"] == 1
+        assert "Just Dropped" in fake_email.sent[0][3]
+        # Second send: the same match now comes back as "For You", not
+        # "Just Dropped" again — still shown (still relevant), just not
+        # re-presented as new.
+        assert second.json()["match_count"] == 1
+        assert "Acme" in fake_email.sent[1][2]
+        assert "For You" in fake_email.sent[1][3]
+        assert "Just Dropped" not in fake_email.sent[1][3]
+
+
+@pytest.mark.asyncio
+async def test_resend_email_caps_just_dropped_at_five_on_a_first_ever_send(web_app):
+    """With no send history yet, "For You" has nothing to draw from — a
+    first-ever email is capped at digest_max_just_dropped (5), not the
+    overall 15, since 20 brand-new matches are all "Just Dropped" candidates
+    and none are "For You" candidates yet."""
+    app, session_factory, fake_email = web_app
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await _signup(client, "alex@example.com")
+        user_id = await _get_user_id(session_factory)
+        for i in range(20):
+            await _seed_posting_and_match(
+                session_factory, user_id=user_id, company=f"Co{i}", title=f"Role {i}", score=0.9 - i * 0.01
+            )
+
+        response = await client.post("/api/matches/resend-email", headers=_csrf(client))
+
+        assert response.json()["match_count"] == 5
+        async with session_factory() as session:
+            all_matches = (await session.execute(select(MatchRow))).scalars().all()
+            notified = [m for m in all_matches if "email" in (m.notified_channels or [])]
+            assert len(notified) == 5
+
+
+@pytest.mark.asyncio
+async def test_resend_email_fills_up_to_fifteen_once_for_you_has_history(web_app):
+    """Once earlier sends have built up a 10-item "For You" pool (two rounds
+    of 5, since each round's "Just Dropped" is itself capped at 5), a later
+    resend with more brand-new matches fills up to the full 15: 5 Just
+    Dropped + 10 For You."""
+    app, session_factory, fake_email = web_app
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await _signup(client, "alex@example.com")
+        user_id = await _get_user_id(session_factory)
+
+        for i in range(5):
+            await _seed_posting_and_match(session_factory, user_id=user_id, company=f"Old{i}", score=0.6)
+        await client.post("/api/matches/resend-email", headers=_csrf(client))  # Old0-4 -> already sent
+
+        for i in range(5, 10):
+            await _seed_posting_and_match(session_factory, user_id=user_id, company=f"Old{i}", score=0.6)
+        await client.post("/api/matches/resend-email", headers=_csrf(client))  # Old5-9 -> already sent
+
+        for i in range(20):
+            await _seed_posting_and_match(session_factory, user_id=user_id, company=f"New{i}", score=0.9)
+        third = await client.post("/api/matches/resend-email", headers=_csrf(client))
+
+        assert third.json()["match_count"] == 15

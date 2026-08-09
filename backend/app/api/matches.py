@@ -13,7 +13,7 @@ from app.config import settings
 from app.db.models import Match as MatchRow
 from app.db.models import Posting as PostingRow
 from app.db.models import User
-from app.notify.curate import curate_matches
+from app.notify.curate import curate_two_section_digest
 from app.notify.dispatch import matches_url
 from app.notify.email_resend import ResendEmailProvider
 from app.notify.email_template import render_digest_email
@@ -240,12 +240,18 @@ async def resend_email(
     email_provider: Annotated[ResendEmailProvider, Depends(get_email_provider)],
 ) -> ResendEmailResponse:
     """On-demand "send me my matches now", triggered explicitly from the
-    dashboard. Deliberately independent of the automated daily_email_cycle:
-    it ignores email_digest_enabled (a manual action shouldn't be blocked by
+    dashboard. Splits into "Just Dropped"/"For You" exactly like the
+    automated daily_email_cycle (see notify.curate.curate_two_section_digest)
+    and, on success, marks whatever "Just Dropped" actually named as
+    delivered by email — the same "never repeat a Just Dropped item"
+    guarantee the automated cycle gives, since both draw from the same
+    notified_channels state.
+
+    Deliberately independent of the automated cycle in one specific way: it
+    ignores email_digest_enabled (a manual action shouldn't be blocked by
     the automatic-subscription toggle) and never touches
-    last_email_digest_sent_on or notified_channels, so pressing this can
-    never cause the automated pipeline to skip or double-send anything it
-    still owes the user — this is a separate action, not a substitute.
+    last_email_digest_sent_on, so pressing this can't suppress or
+    double-trigger the automated once-a-day send.
     """
     if not user.email:
         raise HTTPException(status_code=422, detail="Add an email address to your profile first")
@@ -256,18 +262,29 @@ async def resend_email(
             .join(PostingRow, MatchRow.posting_id == PostingRow.id)
             .where(MatchRow.user_id == user.id, PostingRow.status != "closed")
             .order_by(MatchRow.score.desc(), MatchRow.created_at.desc())
-            .limit(200)
+            .limit(400)
         )
     ).all()
-    matches = [(match_row, posting_row) for match_row, posting_row in rows]
+    pending = [(m, p) for m, p in rows if "email" not in (m.notified_channels or [])]
+    already_sent = [(m, p) for m, p in rows if "email" in (m.notified_channels or [])]
 
-    curated = curate_matches(
-        matches,
+    just_dropped, for_you = curate_two_section_digest(
+        pending,
+        already_sent,
         overall_cap=settings.digest_max_email_matches,
+        just_dropped_cap=settings.digest_max_just_dropped,
         per_company_cap=settings.digest_max_per_company,
     )
-    text, html = render_digest_email(user.name, curated, matches_url())
+    text, html = render_digest_email(user.name, just_dropped, for_you, matches_url())
     success = await email_provider.send(user.email, "Your job matches", text, html=html)
     if not success:
         raise HTTPException(status_code=502, detail="Could not send the email right now — try again shortly")
-    return ResendEmailResponse(sent=True, match_count=len(curated))
+
+    if just_dropped:
+        now = datetime.now(UTC)
+        for match_row, _posting_row in just_dropped:
+            match_row.notified_channels = sorted(set(match_row.notified_channels or []).union(["email"]))
+            match_row.notified_at = match_row.notified_at or now
+        await session.commit()
+
+    return ResendEmailResponse(sent=True, match_count=len(just_dropped) + len(for_you))

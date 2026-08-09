@@ -6,7 +6,6 @@ from app.db.models import Match, Posting, User
 from app.notify.dispatch import (
     _format_email_digest,
     _format_sms_digest,
-    send_digest,
     send_email_digest,
     send_instant,
     send_instants,
@@ -91,88 +90,45 @@ def test_format_email_digest_is_curated_to_the_configured_cap():
     the digest_max_email_matches/digest_max_per_company settings. Each
     posting here is a distinct company, so the per-company cap doesn't come
     into play — this just checks the overall cap and that both a text and
-    an html part are produced."""
+    an html part are produced. No already_sent matches, so everything shown
+    is "Just Dropped" content, further capped at digest_max_just_dropped —
+    see test_format_email_digest_splits_pending_and_already_sent below for
+    the two-section behavior itself."""
     from app.config import settings
 
     items = [(_match(), _posting(posting_key=f"k{i}", company=f"C{i}")) for i in range(30)]
     user = _user()
 
-    text, html, sent = _format_email_digest(user, items)
+    text, html, sent = _format_email_digest(user, items, [])
 
     shown_companies = [f"C{i}" for i in range(30) if f"- C{i}:" in text]
-    assert len(shown_companies) == settings.digest_max_email_matches
+    assert len(shown_companies) == settings.digest_max_just_dropped
     assert "View all your matches" in text
     assert "View all your matches" in html
+    assert len(sent) == settings.digest_max_just_dropped
+
+
+def test_format_email_digest_splits_pending_and_already_sent():
+    """pending -> Just Dropped (capped at digest_max_just_dropped),
+    already_sent -> For You (fills the rest of the overall cap) — see spec
+    addendum: email digest sections."""
+    from app.config import settings
+
+    pending = [(_match(id=i, score=0.9), _posting(posting_key=f"new{i}", company=f"New{i}")) for i in range(10)]
+    already_sent = [
+        (_match(id=100 + i, score=0.6), _posting(posting_key=f"old{i}", company=f"Old{i}")) for i in range(10)
+    ]
+    user = _user()
+
+    text, html, sent = _format_email_digest(user, pending, already_sent)
+
+    new_shown = [f"New{i}" for i in range(10) if f"New{i}" in text]
+    old_shown = [f"Old{i}" for i in range(10) if f"Old{i}" in text]
+    assert len(new_shown) == settings.digest_max_just_dropped
+    assert len(old_shown) == settings.digest_max_email_matches - settings.digest_max_just_dropped
     assert len(sent) == settings.digest_max_email_matches
-
-
-@pytest.mark.asyncio
-async def test_send_digest_skips_opted_out_user():
-    sms = FakeSmsProvider()
-    email = FakeEmailProvider()
-    user = _user(opted_out=True)
-
-    outcome = await send_digest(user, [(_match(), _posting())], sms, email)
-
-    assert sms.sent == []
-    assert email.sent == []
-    assert outcome.sms.skipped
-    assert outcome.delivered is False
-
-
-@pytest.mark.asyncio
-async def test_send_digest_sends_sms_and_email():
-    sms = FakeSmsProvider()
-    email = FakeEmailProvider()
-    user = _user()
-
-    outcome = await send_digest(user, [(_match(), _posting())], sms, email)
-
-    assert len(sms.sent) == 1
-    assert sms.sent[0][0] == user.phone
-    assert len(email.sent) == 1
-    assert email.sent[0][0] == user.email
-    assert outcome.sms.success
-    assert outcome.email is not None and outcome.email.success
-    assert outcome.delivered is True
-
-
-@pytest.mark.asyncio
-async def test_send_digest_skips_email_when_no_address():
-    sms = FakeSmsProvider()
-    email = FakeEmailProvider()
-    user = _user(email=None)
-
-    outcome = await send_digest(user, [(_match(), _posting())], sms, email)
-
-    assert len(sms.sent) == 1
-    assert email.sent == []
-    assert outcome.email is not None and outcome.email.skipped
-    assert outcome.delivered is True  # SMS alone still counts as delivered
-
-
-@pytest.mark.asyncio
-async def test_send_digest_delivered_if_sms_fails_but_email_succeeds():
-    sms = FakeSmsProvider(SendResult(success=False, provider="fake", error="http_500"))
-    email = FakeEmailProvider(success=True)
-    user = _user()
-
-    outcome = await send_digest(user, [(_match(), _posting())], sms, email)
-
-    assert outcome.sms.success is False
-    assert outcome.email is not None and outcome.email.success
-    assert outcome.delivered is True
-
-
-@pytest.mark.asyncio
-async def test_send_digest_not_delivered_if_both_channels_fail():
-    sms = FakeSmsProvider(SendResult(success=False, provider="fake", error="http_500"))
-    email = FakeEmailProvider(success=False)
-    user = _user()
-
-    outcome = await send_digest(user, [(_match(), _posting())], sms, email)
-
-    assert outcome.delivered is False
+    assert "Just Dropped" in html
+    assert "For You" in html
 
 
 @pytest.mark.asyncio
@@ -238,13 +194,25 @@ async def test_email_digest_outcome_reports_only_the_matches_it_sent():
     user = _user(email_digest_enabled=True)
     provider = FakeEmailProvider()
 
-    outcome = await send_email_digest(user, items, provider)
+    outcome = await send_email_digest(user, items, [], provider)
 
     sent_body = provider.sent[0][2]
     named = [f"C{i}" for i in range(40) if f"- C{i}:" in sent_body]
-    assert len(named) == settings.digest_max_email_matches
+    assert len(named) == settings.digest_max_just_dropped
     assert len(outcome.matches) == len(named)
     assert {posting.company for _match, posting in outcome.matches} == set(named)
+
+
+@pytest.mark.asyncio
+async def test_email_digest_skipped_when_digest_disabled():
+    items = [(_match(), _posting())]
+    user = _user(email_digest_enabled=False)
+    provider = FakeEmailProvider()
+
+    outcome = await send_email_digest(user, items, [], provider)
+
+    assert provider.sent == []
+    assert outcome.send.skipped is True
 
 
 @pytest.mark.asyncio

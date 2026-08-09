@@ -1,7 +1,7 @@
 from datetime import UTC, datetime, timedelta
 
 from app.db.models import Match, Posting
-from app.notify.curate import curate_matches
+from app.notify.curate import curate_matches, curate_two_section_digest
 
 
 def _match(**overrides) -> Match:
@@ -87,3 +87,52 @@ def test_curate_matches_tiebreaks_by_created_at_when_scores_equal():
     curated = curate_matches(items, overall_cap=10, per_company_cap=10)
 
     assert [posting.company for _match, posting in curated] == ["B", "A"]
+
+
+def test_curate_two_section_digest_caps_just_dropped_independent_of_overall():
+    pending = [(_match(id=i, score=0.9 - i * 0.01), _posting(id=i, company=f"Co{i}")) for i in range(10)]
+    already_sent = [(_match(id=100 + i, score=0.5), _posting(id=100 + i, company=f"Old{i}")) for i in range(10)]
+
+    just_dropped, for_you = curate_two_section_digest(
+        pending, already_sent, overall_cap=15, just_dropped_cap=5, per_company_cap=10
+    )
+
+    assert len(just_dropped) == 5
+    assert len(for_you) == 10  # fills the rest of the 15 cap
+    assert len(just_dropped) + len(for_you) == 15
+
+
+def test_curate_two_section_digest_for_you_excludes_pending_by_construction():
+    """for_you is drawn only from already_sent — a pending (never-emailed)
+    match must never leak into for_you just because just_dropped didn't
+    have room for it."""
+    pending = [(_match(id=i, score=0.9), _posting(id=i, company=f"Co{i}")) for i in range(10)]
+
+    just_dropped, for_you = curate_two_section_digest(
+        pending, [], overall_cap=15, just_dropped_cap=5, per_company_cap=10
+    )
+
+    assert len(just_dropped) == 5
+    assert for_you == []  # nothing in already_sent to draw from
+
+
+def test_curate_two_section_digest_handles_empty_pools():
+    just_dropped, for_you = curate_two_section_digest(
+        [], [], overall_cap=15, just_dropped_cap=5, per_company_cap=2
+    )
+    assert just_dropped == []
+    assert for_you == []
+
+
+def test_curate_two_section_digest_for_you_respects_per_company_cap():
+    """Isolated from backfill by matching overall_cap to per_company_cap
+    exactly (see curate_matches's own backfill behavior/tests) — otherwise
+    a single-company already_sent pool would legitimately backfill past
+    the cap, same as curate_matches does when nothing else is available."""
+    already_sent = [(_match(id=i, score=0.9 - i * 0.01), _posting(id=i, company="Acme")) for i in range(10)]
+
+    _just_dropped, for_you = curate_two_section_digest(
+        [], already_sent, overall_cap=2, just_dropped_cap=0, per_company_cap=2
+    )
+
+    assert len(for_you) == 2

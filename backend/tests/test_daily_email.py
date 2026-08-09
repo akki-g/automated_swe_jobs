@@ -8,7 +8,7 @@ from app.db.models import Criteria as CriteriaRow
 from app.db.models import Match as MatchRow
 from app.db.models import Posting as PostingRow
 from app.notify.dispatch import send_email_digest
-from app.pipeline import gather_pending_digests
+from app.pipeline import gather_pending_digests, gather_previously_sent_email_matches
 
 
 class FakeEmailProvider:
@@ -83,7 +83,7 @@ async def test_email_digest_is_email_only_and_reuses_curated_formatter():
         url = "https://example.com/job"
 
     provider = FakeEmailProvider()
-    outcome = await send_email_digest(User(), [(Match(), Posting())], provider)
+    outcome = await send_email_digest(User(), [(Match(), Posting())], [], provider)
 
     assert outcome.channel == "email"
     assert outcome.send.success is True
@@ -102,12 +102,97 @@ async def test_completed_profile_gets_a_daily_email_even_without_new_matches(
 
     items = await gather_pending_digests(db_session, channel="email")
     provider = FakeEmailProvider()
-    outcome = await send_email_digest(items[0].user, items[0].matches, provider)
+    outcome = await send_email_digest(items[0].user, items[0].matches, [], provider)
 
     assert len(items) == 1
     assert items[0].matches == []
     assert outcome.send.success is True
     assert "No new job matches today" in provider.sent[0][2]
+
+
+@pytest.mark.asyncio
+async def test_already_sent_matches_fill_for_you_on_a_quiet_day(db_session, demo_user):
+    """A user with zero brand-new matches but a still-open, previously
+    emailed one should get a "For You" reminder instead of an empty
+    digest."""
+    now = datetime.now(UTC)
+    demo_user.profile_completed_at = now
+    demo_user.email_digest_enabled = True
+    posting = PostingRow(
+        posting_key="acme|swe|remote",
+        source="test",
+        company="Acme",
+        title="SWE",
+        url="https://example.com/job",
+        status="open",
+        first_seen_at=now,
+        last_seen_at=now,
+    )
+    db_session.add(posting)
+    await db_session.flush()
+    db_session.add(
+        MatchRow(
+            user_id=demo_user.id,
+            posting_id=posting.id,
+            score=0.9,
+            blurb="Still a great fit",
+            priority="normal",
+            lane="slow",
+            notified_channels=["email"],  # already sent before
+            notified_at=now,
+            created_at=now,
+        )
+    )
+    await db_session.flush()
+
+    pending_items = await gather_pending_digests(db_session, channel="email")
+    already_sent = await gather_previously_sent_email_matches(db_session, [demo_user.id])
+
+    assert pending_items[0].matches == []  # nothing brand new
+    assert len(already_sent[demo_user.id]) == 1  # but there's a "for you" candidate
+
+    provider = FakeEmailProvider()
+    outcome = await send_email_digest(
+        pending_items[0].user, pending_items[0].matches, already_sent[demo_user.id], provider
+    )
+
+    assert "For You" in provider.sent[0][3]
+    assert "Acme" in provider.sent[0][2]
+
+
+@pytest.mark.asyncio
+async def test_previously_sent_matches_exclude_closed_postings(db_session, demo_user):
+    now = datetime.now(UTC)
+    posting = PostingRow(
+        posting_key="dead|swe|remote",
+        source="test",
+        company="DeadCo",
+        title="SWE",
+        url="https://example.com/job",
+        status="closed",
+        first_seen_at=now,
+        last_seen_at=now,
+    )
+    db_session.add(posting)
+    await db_session.flush()
+    db_session.add(
+        MatchRow(
+            user_id=demo_user.id,
+            posting_id=posting.id,
+            score=0.9,
+            blurb="",
+            priority="normal",
+            lane="slow",
+            notified_channels=["email"],
+            notified_at=now,
+            created_at=now,
+        )
+    )
+    await db_session.flush()
+
+    already_sent = await gather_previously_sent_email_matches(db_session, [demo_user.id])
+
+    assert already_sent[demo_user.id] == []
 
 
 @pytest.mark.asyncio

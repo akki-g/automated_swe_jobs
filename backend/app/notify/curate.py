@@ -38,3 +38,35 @@ def curate_matches(
         selected.extend(overflow[: overall_cap - len(selected)])
 
     return selected
+
+
+def curate_two_section_digest(
+    pending: list[tuple[Match, Posting]],
+    already_sent: list[tuple[Match, Posting]],
+    *,
+    overall_cap: int,
+    just_dropped_cap: int,
+    per_company_cap: int,
+) -> tuple[list[tuple[Match, Posting]], list[tuple[Match, Posting]]]:
+    """Splits an email digest into ("Just Dropped", "For You") — see spec
+    addendum: email digest sections.
+
+    `pending` and `already_sent` are mutually exclusive by construction (the
+    caller partitions on whether a match has ever been emailed before — see
+    pipeline.gather_pending_digests / gather_previously_sent_email_matches),
+    so nothing needs deduplication between the two returned lists: a match
+    that appears in "Just Dropped" here can never also appear in "For You"
+    in the same email, and once shown in "Just Dropped" it moves to the
+    `already_sent` pool for every future email (the caller marks it
+    delivered), so it can never appear in "Just Dropped" again either.
+
+    just_dropped is drawn only from `pending`, capped at just_dropped_cap.
+    for_you is drawn only from `already_sent`, filling whatever's left of
+    overall_cap after just_dropped — so a quiet day with few brand-new
+    matches still fills out the email with still-relevant older ones
+    instead of running short.
+    """
+    just_dropped = curate_matches(pending, overall_cap=just_dropped_cap, per_company_cap=per_company_cap)
+    remaining_cap = max(0, overall_cap - len(just_dropped))
+    for_you = curate_matches(already_sent, overall_cap=remaining_cap, per_company_cap=per_company_cap)
+    return just_dropped, for_you

@@ -5,7 +5,7 @@ from dataclasses import dataclass
 
 from app.config import settings
 from app.db.models import Match, Posting, User
-from app.notify.curate import curate_matches
+from app.notify.curate import curate_matches, curate_two_section_digest
 from app.notify.email_resend import ResendEmailProvider
 from app.notify.email_template import render_digest_email
 from app.notify.sms.base import SmsProvider
@@ -38,42 +38,11 @@ class SendOutcome:
 
 
 @dataclass(frozen=True)
-class DigestOutcome:
-    user: User
-    matches: list[tuple[Match, Posting]]
-    sms: SendOutcome
-    email: SendOutcome | None
-
-    @property
-    def delivered(self) -> bool:
-        """A digest counts as delivered if *either* channel got through —
-        an expired Resend API key shouldn't permanently block SMS
-        delivery, and vice versa."""
-        return self.sms.success or bool(self.email and self.email.success)
-
-
-@dataclass(frozen=True)
 class ChannelDigestOutcome:
     user: User
     matches: list[tuple[Match, Posting]]
     channel: str
     send: SendOutcome
-
-
-def _union_by_match(
-    *groups: list[tuple[Match, Posting]],
-) -> list[tuple[Match, Posting]]:
-    """Every match named by at least one channel, de-duplicated on the Match
-    object itself (id is None until flush, so identity is the safe key)."""
-    seen: set[int] = set()
-    merged: list[tuple[Match, Posting]] = []
-    for group in groups:
-        for match, posting in group:
-            if id(match) in seen:
-                continue
-            seen.add(id(match))
-            merged.append((match, posting))
-    return merged
 
 
 def matches_url() -> str:
@@ -103,76 +72,34 @@ def _format_sms_digest(items: list[tuple[Match, Posting]]) -> tuple[str, list[tu
 
 
 def _format_email_digest(
-    user: User, items: list[tuple[Match, Posting]]
+    user: User,
+    pending: list[tuple[Match, Posting]],
+    already_sent: list[tuple[Match, Posting]],
 ) -> tuple[str, str, list[tuple[Match, Posting]]]:
-    """Returns (text, html, sent) — curated to a relevant, diverse top-N
-    rather than every pending match (see spec addendum: digest curation — an
-    uncapped, single-company-dominated digest is what actually made early
-    digests feel irrelevant/spammy).
+    """Returns (text, html, sent) — split into "Just Dropped" (drawn only
+    from `pending`, matches never emailed before) and "For You" (drawn only
+    from `already_sent`, matches an earlier email already showed and are
+    still open/relevant) — see spec addendum: email digest sections, and
+    notify/curate.py::curate_two_section_digest for the actual selection.
 
-    `sent` is returned for the same reason as in _format_sms_digest: the
-    caller must mark only what the email actually listed as notified.
-    Marking the full `items` would let curation silently consume matches the
-    user never saw — with a real 63-match backlog that permanently swallowed
-    48 of them, since a notified match is never picked up by a later digest.
+    `sent` is the union of both sections actually rendered. The caller must
+    mark only `sent` — not `pending` — as delivered: marking the full
+    `pending` would let curation silently consume matches the user never
+    saw — with a real 63-match backlog that permanently swallowed 48 of
+    them, since a notified match is never picked up by a later digest.
+    Re-marking the `already_sent` half is harmless (notified_at/channels are
+    set idempotently — see scheduler._mark_channels_delivered), so including
+    them in `sent` too doesn't need special-casing.
     """
-    curated = curate_matches(
-        items,
+    just_dropped, for_you = curate_two_section_digest(
+        pending,
+        already_sent,
         overall_cap=settings.digest_max_email_matches,
+        just_dropped_cap=settings.digest_max_just_dropped,
         per_company_cap=settings.digest_max_per_company,
     )
-    text, html = render_digest_email(user.name, curated, matches_url())
-    return text, html, curated
-
-
-async def send_digest(
-    user: User,
-    matches: list[tuple[Match, Posting]],
-    sms_provider: SmsProvider,
-    email_provider: ResendEmailProvider,
-) -> DigestOutcome:
-    """Send one digest (SMS + email) to a single user, respecting opt-out."""
-    if user.opted_out or not matches:
-        skipped = SendOutcome(success=False, provider=sms_provider.name, skipped=True)
-        return DigestOutcome(user=user, matches=matches, sms=skipped, email=None)
-
-    sms_result: SendOutcome | None = None
-    email_result: SendOutcome | None = None
-    # What each channel actually named. The two channels curate to different
-    # caps, so neither list is guaranteed to contain the other — the outcome
-    # carries their union, since _record_digest_outcomes marks matches once
-    # either channel delivers.
-    sms_sent: list[tuple[Match, Posting]] = []
-    email_sent: list[tuple[Match, Posting]] = []
-
-    async def _send_sms() -> None:
-        nonlocal sms_result, sms_sent
-        if not _has_sms_number(user):
-            sms_result = SendOutcome(success=False, provider=sms_provider.name, skipped=True)
-            return
-        body, sms_sent = _format_sms_digest(matches)
-        async with _SEND_CONCURRENCY:
-            result = await sms_provider.send(user.phone, body)
-        sms_result = SendOutcome(success=result.success, provider=result.provider, error=result.error)
-
-    async def _send_email() -> None:
-        nonlocal email_result, email_sent
-        if not user.email:
-            email_result = SendOutcome(success=False, provider="resend", skipped=True)
-            return
-        text, html, email_sent = _format_email_digest(user, matches)
-        async with _SEND_CONCURRENCY:
-            success = await email_provider.send(user.email, "New job matches", text, html=html)
-        email_result = SendOutcome(success=success, provider="resend", error=None if success else "send_failed")
-
-    await asyncio.gather(_send_sms(), _send_email())
-    assert sms_result is not None  # noqa: S101 - always set by _send_sms
-    return DigestOutcome(
-        user=user,
-        matches=_union_by_match(sms_sent, email_sent),
-        sms=sms_result,
-        email=email_result,
-    )
+    text, html = render_digest_email(user.name, just_dropped, for_you, matches_url())
+    return text, html, just_dropped + for_you
 
 
 async def send_instant(
@@ -203,33 +130,17 @@ async def send_instants(
     return [(user, match, posting, outcome) for (user, match, posting), outcome in zip(items, outcomes)]
 
 
-async def send_digests(
-    items: list[DigestItem],
-    sms_provider: SmsProvider,
-    email_provider: ResendEmailProvider,
-) -> list[DigestOutcome]:
-    """Fan out digests to many users concurrently, bounded by _SEND_CONCURRENCY
-    (see spec: Notifications — Dispatch concurrency)."""
-    return list(
-        await asyncio.gather(
-            *(
-                send_digest(item.user, item.matches, sms_provider, email_provider)
-                for item in items
-            )
-        )
-    )
-
-
 async def send_email_digest(
     user: User,
-    matches: list[tuple[Match, Posting]],
+    pending: list[tuple[Match, Posting]],
+    already_sent: list[tuple[Match, Posting]],
     email_provider: ResendEmailProvider,
 ) -> ChannelDigestOutcome:
-    sent = matches
+    sent = pending
     if not user.email or not user.email_digest_enabled:
         send = SendOutcome(success=False, provider="resend", skipped=True)
     else:
-        text, html, sent = _format_email_digest(user, matches)
+        text, html, sent = _format_email_digest(user, pending, already_sent)
         async with _SEND_CONCURRENCY:
             success = await email_provider.send(
                 user.email,
@@ -242,7 +153,7 @@ async def send_email_digest(
             provider="resend",
             error=None if success else "send_failed",
         )
-    # `sent`, not `matches`: only what the email actually listed may be
+    # `sent`, not `pending`: only what the email actually listed may be
     # marked notified, or curation silently eats the rest (see
     # _format_email_digest). Anything held back stays pending and leads the
     # next digest, since curate_matches orders by score.
@@ -250,11 +161,18 @@ async def send_email_digest(
 
 
 async def send_email_digests(
-    items: list[DigestItem], email_provider: ResendEmailProvider
+    items: list[DigestItem],
+    already_sent_by_user: dict[int, list[tuple[Match, Posting]]],
+    email_provider: ResendEmailProvider,
 ) -> list[ChannelDigestOutcome]:
     return list(
         await asyncio.gather(
-            *(send_email_digest(item.user, item.matches, email_provider) for item in items)
+            *(
+                send_email_digest(
+                    item.user, item.matches, already_sent_by_user.get(item.user.id, []), email_provider
+                )
+                for item in items
+            )
         )
     )
 

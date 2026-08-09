@@ -10,10 +10,9 @@ from app.db.models import Match as MatchRow
 from app.db.models import Message as MessageRow
 from app.db.models import Posting as PostingRow
 from app.db.models import User
-from app.notify.dispatch import ChannelDigestOutcome, DigestOutcome, SendOutcome
+from app.notify.dispatch import ChannelDigestOutcome, SendOutcome
 from app.scheduler import (
     _record_channel_digest_outcomes,
-    _record_digest_outcomes,
     _record_instant_outcomes,
     build_scheduler,
     reliable_tier_sources,
@@ -137,61 +136,6 @@ async def test_record_instant_outcomes_skips_opted_out_without_logging(db):
         assert refreshed.notified_at is None
         messages = (await session.execute(select(MessageRow))).scalars().all()
         assert messages == []
-
-
-@pytest.mark.asyncio
-async def test_record_digest_outcomes_marks_notified_when_delivered(db):
-    user, match, posting = await _seed(db)
-    outcome = DigestOutcome(
-        user=user,
-        matches=[(match, posting)],
-        sms=SendOutcome(success=True, provider="signalwire"),
-        email=SendOutcome(success=True, provider="resend"),
-    )
-
-    await _record_digest_outcomes([outcome])
-
-    async with db() as session:
-        refreshed = (await session.execute(select(MatchRow).where(MatchRow.id == match.id))).scalar_one()
-        assert refreshed.notified_at is not None
-        assert set(refreshed.notified_channels) == {"sms", "email"}
-        messages = (await session.execute(select(MessageRow))).scalars().all()
-        assert {m.channel for m in messages} == {"sms", "email"}
-
-
-@pytest.mark.asyncio
-async def test_record_digest_outcomes_leaves_unmarked_when_both_channels_fail(db):
-    user, match, posting = await _seed(db)
-    outcome = DigestOutcome(
-        user=user,
-        matches=[(match, posting)],
-        sms=SendOutcome(success=False, provider="signalwire", error="http_500"),
-        email=SendOutcome(success=False, provider="resend", error="send_failed"),
-    )
-
-    await _record_digest_outcomes([outcome])
-
-    async with db() as session:
-        refreshed = (await session.execute(select(MatchRow).where(MatchRow.id == match.id))).scalar_one()
-        assert refreshed.notified_at is None
-
-
-@pytest.mark.asyncio
-async def test_record_digest_outcomes_marks_notified_when_only_sms_delivers(db):
-    user, match, posting = await _seed(db)
-    outcome = DigestOutcome(
-        user=user,
-        matches=[(match, posting)],
-        sms=SendOutcome(success=True, provider="signalwire"),
-        email=SendOutcome(success=False, provider="resend", error="send_failed"),
-    )
-
-    await _record_digest_outcomes([outcome])
-
-    async with db() as session:
-        refreshed = (await session.execute(select(MatchRow).where(MatchRow.id == match.id))).scalar_one()
-        assert refreshed.notified_at is not None
-        assert refreshed.notified_channels == ["sms"]
 
 
 @pytest.mark.asyncio
