@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
 
 import httpx
@@ -28,18 +28,23 @@ from app.watchlist.service import watchlisted_company_keys_by_user
 
 logger = logging.getLogger(__name__)
 
+_POSTING_KEY_QUERY_BATCH_SIZE = 5_000
+
 
 @dataclass
 class MatchCycleResult:
     instant: list[tuple[User, MatchRow, PostingRow]]
     digest_items: list[DigestItem]
+    failed_user_ids: set[int] = field(default_factory=set)
 
 
 async def _fetch_source(source: Source) -> list:
     try:
         return await source.fetch()
     except Exception:  # noqa: BLE001 - isolate one bad source from the rest
-        logger.warning("source %s failed", getattr(source, "name", source), exc_info=True)
+        logger.warning(
+            "source %s failed", getattr(source, "name", source), exc_info=True
+        )
         return []
 
 
@@ -83,15 +88,24 @@ async def _insert_and_touch(
     loading the whole postings table — the table only grows (9,810+ rows in
     a single live run already, per README) and this runs on every fast-lane
     (~2 min) and slow-lane (~15 min) tick, so an unscoped SELECT would get
-    slower every cycle for no benefit; a batch is at most one cycle's worth
-    of fetched postings, so the IN-list stays small and index-backed via the
-    unique posting_key index."""
+    slower every cycle for no benefit. The batch lookup is index-backed and
+    chunked so broad source coverage cannot exceed driver parameter limits."""
     batch_keys = [posting.posting_key for posting in postings]
-    existing = (
-        (await session.execute(select(PostingRow).where(PostingRow.posting_key.in_(batch_keys))))
-        .scalars()
-        .all()
-    )
+    existing: list[PostingRow] = []
+    # Broad category feeds can make one slow-lane sweep tens of thousands of
+    # rows. Chunk the expanding IN predicate so provider growth cannot cross
+    # PostgreSQL/driver bind-parameter limits and take down ingestion.
+    for start in range(0, len(batch_keys), _POSTING_KEY_QUERY_BATCH_SIZE):
+        key_chunk = batch_keys[start : start + _POSTING_KEY_QUERY_BATCH_SIZE]
+        existing.extend(
+            (
+                await session.execute(
+                    select(PostingRow).where(PostingRow.posting_key.in_(key_chunk))
+                )
+            )
+            .scalars()
+            .all()
+        )
     existing_by_key = {row.posting_key: row for row in existing}
 
     for posting in postings:
@@ -108,7 +122,9 @@ async def _insert_and_touch(
     return new_rows
 
 
-async def store_new_postings(session: AsyncSession, postings: list[Posting]) -> list[PostingRow]:
+async def store_new_postings(
+    session: AsyncSession, postings: list[Posting]
+) -> list[PostingRow]:
     """Insert postings not already present (by posting_key); update
     last_seen_at on ones already known. Returns the newly-inserted rows."""
     now = datetime.now(UTC)
@@ -188,13 +204,18 @@ _RANK_CONCURRENCY = asyncio.Semaphore(5)
 
 
 async def _rank_for_user(
-    user: User, criteria: Criteria, survivors: list[Posting], rank_client: AnthropicClient
+    user: User,
+    criteria: Criteria,
+    survivors: list[Posting],
+    rank_client: AnthropicClient,
 ) -> list:
     try:
         async with _RANK_CONCURRENCY:
             return await rank_postings(survivors, criteria, rank_client)
     except Exception:  # noqa: BLE001 - one user's bad state must not sink the whole cycle
-        logger.warning("match_new_postings: ranking failed for user_id=%s", user.id, exc_info=True)
+        logger.warning(
+            "match_new_postings: ranking failed for user_id=%s", user.id, exc_info=True
+        )
         return []
 
 
@@ -223,7 +244,9 @@ async def _find_dead_links(rows: list[PostingRow]) -> set[str]:
     treated as dead (see ingest/link_check.py's fail-open philosophy)."""
     if not rows:
         return set()
-    async with httpx.AsyncClient(timeout=_LINK_CHECK_TIMEOUT_SECONDS, follow_redirects=True) as client:
+    async with httpx.AsyncClient(
+        timeout=_LINK_CHECK_TIMEOUT_SECONDS, follow_redirects=True
+    ) as client:
         # return_exceptions so one unexpected failure can't cancel the whole
         # gather and cost this cycle its link validation entirely; anything
         # that did raise is inconclusive, i.e. not dead.
@@ -238,6 +261,9 @@ async def match_new_postings(
     new_postings: list[PostingRow],
     rank_client: AnthropicClient,
     lane: str = "slow",
+    *,
+    user_ids: list[int] | None = None,
+    match_reason: str = "new_posting",
 ) -> MatchCycleResult:
     """Rule-filter every new posting against every active user's criteria,
     then batch survivors to Claude for scoring/blurb (see spec: Matching).
@@ -252,17 +278,20 @@ async def match_new_postings(
     if not new_postings:
         return MatchCycleResult(instant=[], digest_items=[])
 
+    user_conditions = [
+        User.opted_out.is_(False),
+        # Legacy SMS users have no password hash and remain eligible exactly
+        # as before. Web users wait until onboarding is complete.
+        or_(User.password_hash.is_(None), User.profile_completed_at.is_not(None)),
+    ]
+    if user_ids is not None:
+        user_conditions.append(User.id.in_(user_ids))
+
     users = (
         (
             await session.execute(
                 select(User)
-                .where(
-                    User.opted_out.is_(False),
-                    # Legacy SMS users have no password hash and remain
-                    # eligible exactly as before. Web users do not enter the
-                    # expensive rank/match loop until onboarding is complete.
-                    or_(User.password_hash.is_(None), User.profile_completed_at.is_not(None)),
-                )
+                .where(*user_conditions)
                 .options(selectinload(User.criteria))
             )
         )
@@ -272,10 +301,33 @@ async def match_new_postings(
     postings_domain = [_posting_row_to_domain(row) for row in new_postings]
     postings_by_key = {row.posting_key: row for row in new_postings}
 
+    # Backfills deliberately pass already-stored postings. Some may already
+    # have matched this user after onboarding but before the backfill job ran.
+    # Remove those pairs before ranking, both to avoid wasted model calls and
+    # to uphold uq_matches_user_posting without relying on a flush failure.
+    existing_match_keys_by_user: dict[int, set[str]] = {}
+    if users and new_postings:
+        existing_pairs = (
+            await session.execute(
+                select(MatchRow.user_id, PostingRow.posting_key)
+                .join(PostingRow, MatchRow.posting_id == PostingRow.id)
+                .where(
+                    MatchRow.user_id.in_([user.id for user in users]),
+                    MatchRow.posting_id.in_([row.id for row in new_postings]),
+                )
+            )
+        ).all()
+        for matched_user_id, posting_key in existing_pairs:
+            existing_match_keys_by_user.setdefault(matched_user_id, set()).add(
+                posting_key
+            )
+
     try:
         dead_keys = await _find_dead_links(new_postings)
     except Exception:  # noqa: BLE001 - link validation must never sink the whole cycle
-        logger.warning("match_new_postings: link validation failed unexpectedly", exc_info=True)
+        logger.warning(
+            "match_new_postings: link validation failed unexpectedly", exc_info=True
+        )
         dead_keys = set()
     if dead_keys:
         for row in new_postings:
@@ -291,6 +343,7 @@ async def match_new_postings(
 
     instant: list[tuple[User, MatchRow, PostingRow]] = []
     digest_items: list[DigestItem] = []
+    failed_user_ids: set[int] = set()
 
     # Pass 1: rule-filter every user's criteria against this cycle's new
     # postings (pure, no I/O) and note which users have any survivors.
@@ -301,12 +354,21 @@ async def match_new_postings(
             if criteria_row is None:
                 continue
             criteria = _criteria_row_to_domain(criteria_row)
-            survivors = filter_postings(postings_domain, criteria)
+            already_matched = existing_match_keys_by_user.get(user.id, set())
+            survivors = [
+                posting
+                for posting in filter_postings(postings_domain, criteria)
+                if posting.posting_key not in already_matched
+            ]
             if not survivors:
                 continue
             candidates.append((user, criteria, survivors))
         except Exception:  # noqa: BLE001 - one user's bad state must not sink the whole cycle
-            logger.warning("match_new_postings: filtering failed for user_id=%s", user.id, exc_info=True)
+            logger.warning(
+                "match_new_postings: filtering failed for user_id=%s",
+                user.id,
+                exc_info=True,
+            )
             continue
 
     if not candidates:
@@ -318,13 +380,24 @@ async def match_new_postings(
         session, [user.id for user, _criteria, _survivors in candidates]
     )
     rank_results_by_user = await asyncio.gather(
-        *(_rank_for_user(user, criteria, survivors, rank_client) for user, criteria, survivors in candidates)
+        *(
+            _rank_for_user(user, criteria, survivors, rank_client)
+            for user, criteria, survivors in candidates
+        )
     )
 
     # Pass 3: turn each user's rank results into match rows against the
     # shared session — cheap, in-memory, sequential (AsyncSession isn't
     # safe to use concurrently).
-    for (user, _criteria, survivors), rank_results in zip(candidates, rank_results_by_user):
+    for (user, _criteria, survivors), rank_results in zip(
+        candidates, rank_results_by_user
+    ):
+        if len({result.posting_key for result in rank_results}) < len(survivors):
+            # The ranker contract asks for one result per posting. Missing
+            # results normally mean a failed/truncated provider response. A
+            # profile backfill uses this signal to leave its completion
+            # marker unset and retry only the still-unmatched pairs later.
+            failed_user_ids.add(user.id)
         watched_keys = watched_by_user.get(user.id, set())
         rank_by_key = {r.posting_key: r for r in rank_results}
 
@@ -369,7 +442,7 @@ async def match_new_postings(
                 blurb=rank_result.blurb,
                 priority=priority.value,
                 lane=lane,
-                match_reason="watchlist" if is_watched else "new_posting",
+                match_reason="watchlist" if is_watched else match_reason,
                 notified_channels=[],
                 notified_at=None,
                 matched_target_field=(
@@ -388,7 +461,99 @@ async def match_new_postings(
             digest_items.append(DigestItem(user=user, matches=matches_for_digest))
 
     await session.flush()
-    return MatchCycleResult(instant=instant, digest_items=digest_items)
+    return MatchCycleResult(
+        instant=instant,
+        digest_items=digest_items,
+        failed_user_ids=failed_user_ids,
+    )
+
+
+async def backfill_completed_profiles(
+    session: AsyncSession,
+    rank_client: AnthropicClient,
+) -> MatchCycleResult:
+    """Seed new web users from recent open inventory.
+
+    Normal scrape matching intentionally processes only newly inserted rows.
+    That is efficient for established users, but it means jobs already in the
+    database before a signup are otherwise invisible to that user forever.
+    Process a bounded number of pending profiles and postings per cycle, then
+    mark each profile so the backfill is one-time and restart-safe.
+    """
+    pending_users = (
+        (
+            await session.execute(
+                select(User)
+                .where(
+                    User.password_hash.is_not(None),
+                    User.profile_completed_at.is_not(None),
+                    User.initial_matches_generated_at.is_(None),
+                    User.opted_out.is_(False),
+                )
+                .options(selectinload(User.criteria))
+                .order_by(User.profile_completed_at.asc(), User.id.asc())
+                .limit(settings.profile_backfill_max_users_per_cycle)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    if not pending_users:
+        return MatchCycleResult(instant=[], digest_items=[])
+
+    # Fetch a separate recent window for each requested opportunity type so
+    # a large internship inventory cannot crowd all new-grad rows (or vice
+    # versa) out of the bounded backfill. The shared row set is link-checked
+    # once and match_new_postings still filters it per user.
+    requested_role_types = {
+        role_type
+        for user in pending_users
+        if user.criteria is not None
+        for role_type in (user.criteria.role_types or [])
+    }
+    rows_by_id: dict[int, PostingRow] = {}
+    for role_type in requested_role_types:
+        role_rows = (
+            (
+                await session.execute(
+                    select(PostingRow)
+                    .where(
+                        PostingRow.status == "open", PostingRow.role_type == role_type
+                    )
+                    .order_by(
+                        PostingRow.posted_at.desc().nullslast(),
+                        PostingRow.first_seen_at.desc(),
+                        PostingRow.id.desc(),
+                    )
+                    .limit(settings.profile_backfill_max_postings_per_user)
+                )
+            )
+            .scalars()
+            .all()
+        )
+        rows_by_id.update({row.id: row for row in role_rows})
+
+    result = await match_new_postings(
+        session,
+        list(rows_by_id.values()),
+        rank_client,
+        lane="backfill",
+        user_ids=[user.id for user in pending_users],
+        match_reason="profile_backfill",
+    )
+    completed_at = datetime.now(UTC)
+    for user in pending_users:
+        if user.id not in result.failed_user_ids:
+            user.initial_matches_generated_at = completed_at
+        logger.info(
+            "profile backfill: user_id=%s considered=%d complete=%s",
+            user.id,
+            len(rows_by_id),
+            user.id not in result.failed_user_ids,
+        )
+
+    await session.flush()
+    return result
 
 
 async def gather_pending_digests(
@@ -434,17 +599,14 @@ async def gather_pending_digests(
         raise ValueError(f"unsupported digest channel: {channel}")
 
     rows = (
-        (
-            await session.execute(
-                select(MatchRow, PostingRow, User)
-                .join(PostingRow, MatchRow.posting_id == PostingRow.id)
-                .join(User, MatchRow.user_id == User.id)
-                .where(*conditions)
-                .order_by(MatchRow.created_at, MatchRow.id)
-            )
+        await session.execute(
+            select(MatchRow, PostingRow, User)
+            .join(PostingRow, MatchRow.posting_id == PostingRow.id)
+            .join(User, MatchRow.user_id == User.id)
+            .where(*conditions)
+            .order_by(MatchRow.created_at, MatchRow.id)
         )
-        .all()
-    )
+    ).all()
 
     by_user: dict[int, DigestItem] = {}
     for match_row, posting_row, user in rows:
@@ -462,11 +624,7 @@ async def gather_pending_digests(
         # query above cannot return users with zero pending rows, so union in
         # all eligible recipients after grouping the real matches.
         eligible_users = (
-            (
-                await session.execute(
-                    select(User).where(*email_user_conditions)
-                )
-            )
+            (await session.execute(select(User).where(*email_user_conditions)))
             .scalars()
             .all()
         )
@@ -504,7 +662,9 @@ async def gather_previously_sent_email_matches(
             )
         )
     ).all()
-    by_user: dict[int, list[tuple[MatchRow, PostingRow]]] = {user_id: [] for user_id in user_ids}
+    by_user: dict[int, list[tuple[MatchRow, PostingRow]]] = {
+        user_id: [] for user_id in user_ids
+    }
     for match_row, posting_row in rows:
         if "email" in (match_row.notified_channels or []):
             by_user[match_row.user_id].append((match_row, posting_row))

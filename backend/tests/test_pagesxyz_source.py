@@ -61,6 +61,17 @@ SAMPLE_ENTRIES = [
         "categories": "software-engineering",
     },
     {
+        "id": "gamma-1",
+        "company": "gamma",
+        "company_name": "Gamma",
+        "title": "Marketing Coordinator",
+        "level": "Entry Level",
+        "location": "Chicago",
+        "apply_link": "https://example.com/apply/3",
+        "posted_at": "2026-08-19T03:14:39.529541+00:00",
+        "categories": "marketing",
+    },
+    {
         "id": "beta-1",
         "company": "beta",
         "company_name": "Beta Corp",
@@ -85,7 +96,7 @@ async def test_fetch_sends_api_key_header_and_expected_params(monkeypatch):
     call = fake.calls[0]
     assert call["headers"] == {"apikey": "test-key"}
     assert call["params"]["categories"] == "ilike.%software-engineering%"
-    assert len(postings) == 2
+    assert len(postings) == 3
 
 
 @pytest.mark.asyncio
@@ -102,8 +113,13 @@ async def test_fetch_maps_fields_and_infers_role_type(monkeypatch):
     assert new_grad.posted_at is not None
 
     senior = next(p for p in postings if p.company == "Beta Corp")
-    assert senior.role_type is None  # not new-grad/intern-shaped, correctly unclassified
+    assert (
+        senior.role_type is None
+    )  # not new-grad/intern-shaped, correctly unclassified
     assert senior.posted_at is None
+
+    structured_entry_level = next(p for p in postings if p.company == "Gamma")
+    assert structured_entry_level.role_type == RoleType.NEW_GRAD
 
 
 @pytest.mark.asyncio

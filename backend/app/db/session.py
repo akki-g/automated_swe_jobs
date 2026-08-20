@@ -43,6 +43,7 @@ def _ensure_web_profile_columns(connection) -> None:
     user_additions = {
         "password_hash": "VARCHAR(255)",
         "profile_completed_at": "TIMESTAMP WITH TIME ZONE",
+        "initial_matches_generated_at": "TIMESTAMP WITH TIME ZONE",
         "email_digest_enabled": "BOOLEAN NOT NULL DEFAULT true",
         "email_digest_time": "VARCHAR(5) NOT NULL DEFAULT '08:00'",
         "last_email_digest_sent_on": "DATE",
@@ -51,7 +52,9 @@ def _ensure_web_profile_columns(connection) -> None:
     }
     for name, definition in user_additions.items():
         if name not in user_columns:
-            connection.exec_driver_sql(f"ALTER TABLE users ADD COLUMN {name} {definition}")
+            connection.exec_driver_sql(
+                f"ALTER TABLE users ADD COLUMN {name} {definition}"
+            )
 
     criteria_columns = {column["name"] for column in inspector.get_columns("criteria")}
     criteria_additions = {
@@ -61,7 +64,9 @@ def _ensure_web_profile_columns(connection) -> None:
     }
     for name, definition in criteria_additions.items():
         if name not in criteria_columns:
-            connection.exec_driver_sql(f"ALTER TABLE criteria ADD COLUMN {name} {definition}")
+            connection.exec_driver_sql(
+                f"ALTER TABLE criteria ADD COLUMN {name} {definition}"
+            )
 
     if "matches" in inspector.get_table_names():
         match_columns = {column["name"] for column in inspector.get_columns("matches")}
@@ -71,7 +76,9 @@ def _ensure_web_profile_columns(connection) -> None:
         }
         for name, definition in match_additions.items():
             if name not in match_columns:
-                connection.exec_driver_sql(f"ALTER TABLE matches ADD COLUMN {name} {definition}")
+                connection.exec_driver_sql(
+                    f"ALTER TABLE matches ADD COLUMN {name} {definition}"
+                )
 
     connection.exec_driver_sql(
         "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_email ON users (email)"
@@ -106,6 +113,7 @@ def _ensure_web_profile_columns(connection) -> None:
         # EXCLUSIVE lock each time, even where the values happen to survive.
         for table, column in (
             ("users", "profile_completed_at"),
+            ("users", "initial_matches_generated_at"),
             ("users", "matches_last_viewed_at"),
             ("users", "matches_visit_started_at"),
             ("criteria", "resume_updated_at"),
@@ -186,7 +194,8 @@ def _backfill_truncated_posting_keys(connection, inspector) -> None:
         return
 
     existing_keys = {
-        row[0] for row in connection.execute(text("SELECT posting_key FROM postings")).all()
+        row[0]
+        for row in connection.execute(text("SELECT posting_key FROM postings")).all()
     }
     rekeyed = 0
     for posting_id, company, title, location, current_key in candidates:

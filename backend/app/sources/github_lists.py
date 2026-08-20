@@ -15,7 +15,7 @@ NEW_GRAD_LISTINGS_URL = (
     "dev/.github/scripts/listings.json"
 )
 INTERNSHIP_LISTINGS_URL = (
-    "https://raw.githubusercontent.com/SimplifyJobs/Summer2026-Internships/"
+    "https://raw.githubusercontent.com/SimplifyJobs/Summer2027-Internships/"
     "dev/.github/scripts/listings.json"
 )
 
@@ -108,4 +108,6 @@ def new_grad_source() -> GitHubListSource:
 
 
 def internship_source() -> GitHubListSource:
-    return GitHubListSource("github_internship", INTERNSHIP_LISTINGS_URL, RoleType.INTERN)
+    return GitHubListSource(
+        "github_internship", INTERNSHIP_LISTINGS_URL, RoleType.INTERN
+    )

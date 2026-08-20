@@ -147,6 +147,12 @@ async def update_profile(
     user.email_digest_time = body.email_digest_time
     if body.mark_complete:
         user.profile_completed_at = user.profile_completed_at or now
+    if user.profile_completed_at is not None:
+        # Criteria edits can make previously-irrelevant open jobs newly
+        # relevant. Re-run the bounded inventory backfill; existing match
+        # pairs are excluded by the pipeline, so this only adds newly fitting
+        # rows rather than duplicating prior results.
+        user.initial_matches_generated_at = None
     criteria.role_types = [value.value for value in body.role_types]
     criteria.target_fields = [value.value for value in body.target_fields]
     criteria.keywords = body.keywords
@@ -158,7 +164,9 @@ async def update_profile(
     return _response(user, criteria)
 
 
-@router.put("/settings", response_model=ProfileResponse, dependencies=[Depends(require_csrf)])
+@router.put(
+    "/settings", response_model=ProfileResponse, dependencies=[Depends(require_csrf)]
+)
 async def update_email_settings(
     body: EmailSettingsUpdate,
     user: Annotated[User, Depends(get_current_user)],

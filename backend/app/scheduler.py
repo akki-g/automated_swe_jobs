@@ -26,6 +26,7 @@ from app.notify.email_resend import ResendEmailProvider
 from app.notify.sms.signalwire import SignalWireSmsProvider
 from app.pipeline import (
     MatchCycleResult,
+    backfill_completed_profiles,
     gather_pending_digests,
     gather_previously_sent_email_matches,
     mark_stale_postings,
@@ -57,12 +58,16 @@ async def default_sources(session) -> list[Source]:
     return await reliable_tier_sources(session) + registry.aggregator_sources()
 
 
-async def _mark_channels_delivered(session, match_ids: list[int], channels: list[str]) -> None:
+async def _mark_channels_delivered(
+    session, match_ids: list[int], channels: list[str]
+) -> None:
     if not match_ids:
         return
     rows = (
-        await session.execute(select(MatchRow).where(MatchRow.id.in_(match_ids)))
-    ).scalars().all()
+        (await session.execute(select(MatchRow).where(MatchRow.id.in_(match_ids))))
+        .scalars()
+        .all()
+    )
     now = datetime.now(UTC)
     for row in rows:
         row.notified_channels = sorted(set(row.notified_channels or []).union(channels))
@@ -181,7 +186,9 @@ async def _check_for_changes(source: Source) -> bool:
     except NotImplementedError:
         return False
     except Exception:  # noqa: BLE001 - one source's check must not skip the rest
-        logger.warning("fast lane: check_for_changes failed for %s", source.name, exc_info=True)
+        logger.warning(
+            "fast lane: check_for_changes failed for %s", source.name, exc_info=True
+        )
         return False
 
 
@@ -200,8 +207,12 @@ async def fast_lane_cycle() -> MatchCycleResult:
     # checking them concurrently is what makes this lane worth calling
     # "fast" — checking N sources one-at-a-time would make the fast lane's
     # own polling latency scale with the size of companies.yaml.
-    changed_flags = await asyncio.gather(*(_check_for_changes(source) for source in sources))
-    changed = [source for source, has_changed in zip(sources, changed_flags) if has_changed]
+    changed_flags = await asyncio.gather(
+        *(_check_for_changes(source) for source in sources)
+    )
+    changed = [
+        source for source, has_changed in zip(sources, changed_flags) if has_changed
+    ]
 
     if not changed:
         return MatchCycleResult(instant=[], digest_items=[])
@@ -223,6 +234,26 @@ async def slow_lane_cycle() -> MatchCycleResult:
         sources = await default_sources(session)
 
     return await _process_new_postings(sources, lane="slow", sms_provider=sms_provider)
+
+
+async def profile_backfill_cycle() -> MatchCycleResult:
+    """Give newly-completed profiles matches from jobs already in storage.
+
+    This is independent of scrape cadence: a new user should not have to wait
+    for a company to publish another job before anything can appear on their
+    dashboard. The pipeline bounds users and postings per run and records a
+    completion marker, making this safe to poll frequently.
+    """
+    rank_client = AnthropicMessagesClient()
+    sms_provider = SignalWireSmsProvider()
+    async with session_scope() as session:
+        result = await backfill_completed_profiles(session, rank_client)
+        await session.commit()
+
+    if result.instant:
+        outcomes = await send_instants(result.instant, sms_provider)
+        await _record_instant_outcomes(outcomes)
+    return result
 
 
 async def digest_cycle() -> list[ChannelDigestOutcome]:
@@ -261,10 +292,10 @@ async def daily_email_cycle(now: datetime | None = None) -> list[ChannelDigestOu
         )
     if not digest_items:
         return []
-    outcomes = await send_email_digests(digest_items, already_sent_by_user, email_provider)
-    await _record_channel_digest_outcomes(
-        outcomes, email_digest_sent_on=digest_date
+    outcomes = await send_email_digests(
+        digest_items, already_sent_by_user, email_provider
     )
+    await _record_channel_digest_outcomes(outcomes, email_digest_sent_on=digest_date)
     return outcomes
 
 
@@ -282,6 +313,13 @@ def build_scheduler() -> AsyncIOScheduler:
         "interval",
         minutes=settings.slow_lane_interval_minutes,
         id="slow_lane_cycle",
+        max_instances=1,
+    )
+    scheduler.add_job(
+        profile_backfill_cycle,
+        "interval",
+        minutes=settings.profile_backfill_interval_minutes,
+        id="profile_backfill_cycle",
         max_instances=1,
     )
     scheduler.add_job(

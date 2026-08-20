@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 from app.config import settings
-from app.sources.aggregators import PagesXyzSource
+from app.sources.aggregators import (
+    PAGESXYZ_CATEGORIES,
+    PAGESXYZ_LIMIT_PER_CATEGORY,
+    PagesXyzSource,
+)
 from app.sources.ats import build_ats_sources
 from app.sources.ats.ashby import AshbySource
 from app.sources.ats.greenhouse import GreenhouseSource
@@ -60,8 +64,13 @@ class SourceRegistry:
         if self._aggregators_loaded:
             return
         if settings.pagesxyz_api_key:
-            source = PagesXyzSource(api_key=settings.pagesxyz_api_key)
-            self._aggregators_by_name.setdefault(source.name, source)
+            for category in PAGESXYZ_CATEGORIES:
+                source = PagesXyzSource(
+                    api_key=settings.pagesxyz_api_key,
+                    category=category,
+                    limit=PAGESXYZ_LIMIT_PER_CATEGORY,
+                )
+                self._aggregators_by_name.setdefault(source.name, source)
         self._aggregators_loaded = True
 
     def aggregator_sources(self) -> list[Source]:

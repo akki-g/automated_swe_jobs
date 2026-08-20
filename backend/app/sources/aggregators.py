@@ -7,11 +7,48 @@ from email.utils import parsedate_to_datetime
 
 import httpx
 
-from app.domain.models import RawPosting
+from app.domain.models import RawPosting, TargetField
 from app.sources.ats.common import infer_role_type
 from app.sources.base import Source
 
 logger = logging.getLogger(__name__)
+
+# pagesxyz exposes one category filter per request. Register a deliberately
+# broad set so this best-effort tier supplements the tech-heavy GitHub lists
+# for every field users can select during onboarding.
+PAGESXYZ_CATEGORIES_BY_FIELD: dict[TargetField, tuple[str, ...]] = {
+    TargetField.SOFTWARE_ENGINEERING: (
+        "software-engineering",
+        "information-technology",
+    ),
+    TargetField.DATA_SCIENCE_ANALYTICS: ("data-analysis", "data-science"),
+    TargetField.PRODUCT_MANAGEMENT: ("product-management",),
+    TargetField.FINANCE_INVESTMENT_BANKING: (
+        "corporate-finance",
+        "accounting",
+        "wealth-management",
+        "venture-capital",
+        "equity-research",
+        "middle-office",
+    ),
+    TargetField.CONSULTING: ("consulting",),
+    TargetField.MARKETING: ("marketing", "communications"),
+    TargetField.SALES: ("sales-broad", "sales-engineering", "customer-success"),
+    TargetField.OPERATIONS: ("operations-management", "logistics", "supply-chain"),
+    TargetField.DESIGN: ("product-design",),
+}
+PAGESXYZ_CATEGORIES = tuple(
+    dict.fromkeys(
+        category
+        for categories in PAGESXYZ_CATEGORIES_BY_FIELD.values()
+        for category in categories
+    )
+)
+# Twenty-one category requests at the adapter's 1,000-row default could add
+# 21,000 rows to one slow-lane batch before reliable sources are included.
+# The newest 500 per category retains broad coverage while keeping the
+# combined posting-key lookup below common database bind-parameter limits.
+PAGESXYZ_LIMIT_PER_CATEGORY = 500
 
 
 class RssFeedSource(Source):
@@ -49,12 +86,19 @@ class RssFeedSource(Source):
         for item in root.iter("item"):
             title_el = item.find("title")
             link_el = item.find("link")
-            if title_el is None or link_el is None or not title_el.text or not link_el.text:
+            if (
+                title_el is None
+                or link_el is None
+                or not title_el.text
+                or not link_el.text
+            ):
                 continue
             postings.append(self._to_raw_posting(item, title_el.text, link_el.text))
         return postings
 
-    def _to_raw_posting(self, item: ET.Element, raw_title: str, link: str) -> RawPosting:
+    def _to_raw_posting(
+        self, item: ET.Element, raw_title: str, link: str
+    ) -> RawPosting:
         company, title = self._split_title(raw_title)
         pub_date_el = item.find("pubDate")
         posted_at: datetime | None = None
@@ -101,7 +145,9 @@ class PagesXyzSource(Source):
         "salary_min,salary_max,years_min,years_max,posted_at,categories"
     )
 
-    def __init__(self, api_key: str, category: str = "software-engineering", limit: int = 1000) -> None:
+    def __init__(
+        self, api_key: str, category: str = "software-engineering", limit: int = 1000
+    ) -> None:
         self.name = f"pagesxyz:{category}"
         self.api_key = api_key
         self.category = category
@@ -145,7 +191,9 @@ class PagesXyzSource(Source):
         raw_posted = entry.get("posted_at")
         if raw_posted:
             try:
-                posted_at = datetime.fromisoformat(raw_posted.replace("Z", "+00:00")).astimezone(UTC)
+                posted_at = datetime.fromisoformat(
+                    raw_posted.replace("Z", "+00:00")
+                ).astimezone(UTC)
             except (TypeError, ValueError):
                 posted_at = None
 
@@ -155,7 +203,11 @@ class PagesXyzSource(Source):
             title=title,
             url=url,
             location=entry.get("location") or None,
-            role_type=infer_role_type(title),
+            # This aggregator provides a structured level even when a title
+            # itself omits words like "intern" or "entry-level" (common for
+            # marketing, sales, operations, and design). Use both signals so
+            # those fields are not accidentally filtered out as senior roles.
+            role_type=infer_role_type(title, entry.get("level")),
             posted_at=posted_at,
             raw=entry,
         )

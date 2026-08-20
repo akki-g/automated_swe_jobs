@@ -26,14 +26,29 @@ class User(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     name: Mapped[str] = mapped_column(String(120))
-    phone: Mapped[str | None] = mapped_column(String(20), unique=True, index=True, nullable=True)
-    email: Mapped[str | None] = mapped_column(String(255), unique=True, index=True, nullable=True)
+    phone: Mapped[str | None] = mapped_column(
+        String(20), unique=True, index=True, nullable=True
+    )
+    email: Mapped[str | None] = mapped_column(
+        String(255), unique=True, index=True, nullable=True
+    )
     password_hash: Mapped[str | None] = mapped_column(String(255), nullable=True)
     sms_provider: Mapped[str] = mapped_column(String(20), default="signalwire")
     opted_out: Mapped[bool] = mapped_column(Boolean, default=False)
-    consent_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
-    consent_method: Mapped[str] = mapped_column(String(50), default="verbal-friend-onboarding")
+    consent_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    consent_method: Mapped[str] = mapped_column(
+        String(50), default="verbal-friend-onboarding"
+    )
     profile_completed_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
+    # Set after the scheduler has matched a newly-completed web profile
+    # against the recent open inventory that predates that user's signup.
+    # Without this marker, matching only ever sees brand-new Posting rows and
+    # a new user can have an empty dashboard indefinitely.
+    initial_matches_generated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
     email_digest_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
@@ -51,7 +66,9 @@ class User(Base):
     )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
-    criteria: Mapped["Criteria | None"] = relationship(back_populates="user", uselist=False)
+    criteria: Mapped["Criteria | None"] = relationship(
+        back_populates="user", uselist=False
+    )
 
 
 class Criteria(Base):
@@ -64,7 +81,9 @@ class Criteria(Base):
     keywords: Mapped[list[str]] = mapped_column(JSON, default=list)
     locations: Mapped[list[str]] = mapped_column(JSON, default=list)
     sponsorship_required: Mapped[bool | None] = mapped_column(Boolean, nullable=True)
-    min_date: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    min_date: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     freeform_notes: Mapped[str] = mapped_column(String(2000), default="")
     resume_profile: Mapped[dict] = mapped_column(JSON, default=dict)
     resume_updated_at: Mapped[datetime | None] = mapped_column(
@@ -91,7 +110,9 @@ class Posting(Base):
     url: Mapped[str] = mapped_column(String(1000))
     location: Mapped[str | None] = mapped_column(String(255), nullable=True)
     role_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
-    posted_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    posted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     raw: Mapped[dict] = mapped_column(JSON, default=dict)
     status: Mapped[str] = mapped_column(String(20), default="open")
     first_seen_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -114,7 +135,9 @@ class Match(Base):
     lane: Mapped[str] = mapped_column(String(10), default="slow")
     match_reason: Mapped[str] = mapped_column(String(50), default="new_posting")
     notified_channels: Mapped[list[str]] = mapped_column(JSON, default=list)
-    notified_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    notified_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     matched_target_field: Mapped[str | None] = mapped_column(String(50), nullable=True)
     saved: Mapped[bool] = mapped_column(Boolean, default=False)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
@@ -129,7 +152,9 @@ class Watchlist(Base):
     board; `status` tracks whether that detection succeeded."""
 
     __tablename__ = "watchlist"
-    __table_args__ = (UniqueConstraint("user_id", "company_key", name="uq_watchlist_user_company"),)
+    __table_args__ = (
+        UniqueConstraint("user_id", "company_key", name="uq_watchlist_user_company"),
+    )
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
@@ -137,7 +162,9 @@ class Watchlist(Base):
     company_key: Mapped[str] = mapped_column(String(255), index=True)
     ats_provider: Mapped[str | None] = mapped_column(String(20), nullable=True)
     ats_slug: Mapped[str | None] = mapped_column(String(120), nullable=True)
-    status: Mapped[str] = mapped_column(String(20), default="pending")  # pending/active/not_found
+    status: Mapped[str] = mapped_column(
+        String(20), default="pending"
+    )  # pending/active/not_found
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
 
 
@@ -146,7 +173,9 @@ class Message(Base):
 
     id: Mapped[int] = mapped_column(Integer, primary_key=True)
     user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
-    match_id: Mapped[int | None] = mapped_column(ForeignKey("matches.id"), nullable=True)
+    match_id: Mapped[int | None] = mapped_column(
+        ForeignKey("matches.id"), nullable=True
+    )
     direction: Mapped[str] = mapped_column(String(10))  # "inbound" | "outbound"
     channel: Mapped[str] = mapped_column(String(10))  # "sms" | "email"
     provider: Mapped[str] = mapped_column(String(20), default="")

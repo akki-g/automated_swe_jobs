@@ -52,11 +52,16 @@ def test_web_profile_schema_upgrade_is_additive_and_idempotent():
         assert {
             "password_hash",
             "profile_completed_at",
+            "initial_matches_generated_at",
             "email_digest_enabled",
             "email_digest_time",
             "last_email_digest_sent_on",
         } <= user_columns
-        assert {"target_fields", "resume_profile", "resume_updated_at"} <= criteria_columns
+        assert {
+            "target_fields",
+            "resume_profile",
+            "resume_updated_at",
+        } <= criteria_columns
 
 
 @pytest.mark.asyncio
@@ -84,14 +89,20 @@ async def test_backfill_rekeys_postings_stored_before_the_component_cap():
                 "status, first_seen_at, last_seen_at) VALUES (:key, 'test', 'Acme', :title, "
                 "'https://example.com/job', 'Remote', '{}', 'open', :now, :now)"
             ),
-            {"key": legacy_key, "title": long_title, "now": datetime.now(UTC).isoformat(" ")},
+            {
+                "key": legacy_key,
+                "title": long_title,
+                "now": datetime.now(UTC).isoformat(" "),
+            },
         )
 
     async with engine.begin() as connection:
         await connection.run_sync(_ensure_web_profile_columns)
 
     async with engine.connect() as connection:
-        stored = (await connection.execute(text("SELECT posting_key FROM postings"))).scalar_one()
+        stored = (
+            await connection.execute(text("SELECT posting_key FROM postings"))
+        ).scalar_one()
 
     assert stored == build_posting_key("Acme", long_title, "Remote")
     assert stored != legacy_key
@@ -126,7 +137,12 @@ async def test_backfill_leaves_a_row_alone_when_the_new_key_is_taken():
         await connection.run_sync(_ensure_web_profile_columns)
 
     async with engine.connect() as connection:
-        keys = {row[0] for row in (await connection.execute(text("SELECT posting_key FROM postings"))).all()}
+        keys = {
+            row[0]
+            for row in (
+                await connection.execute(text("SELECT posting_key FROM postings"))
+            ).all()
+        }
 
     assert keys == {capped_key, legacy_key}
     await engine.dispose()

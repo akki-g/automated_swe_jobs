@@ -97,7 +97,9 @@ async def test_record_instant_outcomes_marks_notified_only_on_success(db):
     await _record_instant_outcomes(outcomes)
 
     async with db() as session:
-        refreshed = (await session.execute(select(MatchRow).where(MatchRow.id == match.id))).scalar_one()
+        refreshed = (
+            await session.execute(select(MatchRow).where(MatchRow.id == match.id))
+        ).scalar_one()
         assert refreshed.notified_at is not None
         assert refreshed.notified_channels == ["sms"]
         messages = (await session.execute(select(MessageRow))).scalars().all()
@@ -109,13 +111,20 @@ async def test_record_instant_outcomes_marks_notified_only_on_success(db):
 async def test_record_instant_outcomes_leaves_failed_send_unmarked(db):
     user, match, posting = await _seed(db)
     outcomes = [
-        (user, match, posting, SendOutcome(success=False, provider="signalwire", error="http_500")),
+        (
+            user,
+            match,
+            posting,
+            SendOutcome(success=False, provider="signalwire", error="http_500"),
+        ),
     ]
 
     await _record_instant_outcomes(outcomes)
 
     async with db() as session:
-        refreshed = (await session.execute(select(MatchRow).where(MatchRow.id == match.id))).scalar_one()
+        refreshed = (
+            await session.execute(select(MatchRow).where(MatchRow.id == match.id))
+        ).scalar_one()
         assert refreshed.notified_at is None  # must stay pending so it can be retried
         messages = (await session.execute(select(MessageRow))).scalars().all()
         assert len(messages) == 1
@@ -126,13 +135,20 @@ async def test_record_instant_outcomes_leaves_failed_send_unmarked(db):
 async def test_record_instant_outcomes_skips_opted_out_without_logging(db):
     user, match, posting = await _seed(db)
     outcomes = [
-        (user, match, posting, SendOutcome(success=False, provider="signalwire", skipped=True)),
+        (
+            user,
+            match,
+            posting,
+            SendOutcome(success=False, provider="signalwire", skipped=True),
+        ),
     ]
 
     await _record_instant_outcomes(outcomes)
 
     async with db() as session:
-        refreshed = (await session.execute(select(MatchRow).where(MatchRow.id == match.id))).scalar_one()
+        refreshed = (
+            await session.execute(select(MatchRow).where(MatchRow.id == match.id))
+        ).scalar_one()
         assert refreshed.notified_at is None
         messages = (await session.execute(select(MessageRow))).scalars().all()
         assert messages == []
@@ -160,10 +176,13 @@ def test_scheduler_keeps_sms_digest_and_adds_daily_email_job():
     assert {job.id for job in scheduler.get_jobs()} == {
         "fast_lane_cycle",
         "slow_lane_cycle",
+        "profile_backfill_cycle",
         "digest_cycle",
         "daily_email_cycle",
     }
-    email_job = next(job for job in scheduler.get_jobs() if job.id == "daily_email_cycle")
+    email_job = next(
+        job for job in scheduler.get_jobs() if job.id == "daily_email_cycle"
+    )
     assert str(email_job.trigger) == "cron[minute='*']"
 
 
@@ -171,7 +190,9 @@ def test_scheduler_keeps_sms_digest_and_adds_daily_email_job():
 async def test_email_recording_merges_with_existing_sms_channel(db):
     user, match, posting = await _seed(db)
     async with db() as session:
-        stored = (await session.execute(select(MatchRow).where(MatchRow.id == match.id))).scalar_one()
+        stored = (
+            await session.execute(select(MatchRow).where(MatchRow.id == match.id))
+        ).scalar_one()
         stored.notified_channels = ["sms"]
         stored.notified_at = datetime.now(UTC)
         await session.commit()
@@ -190,7 +211,11 @@ async def test_email_recording_merges_with_existing_sms_channel(db):
     )
 
     async with db() as session:
-        refreshed = (await session.execute(select(MatchRow).where(MatchRow.id == match.id))).scalar_one()
+        refreshed = (
+            await session.execute(select(MatchRow).where(MatchRow.id == match.id))
+        ).scalar_one()
         assert set(refreshed.notified_channels) == {"sms", "email"}
-        refreshed_user = (await session.execute(select(User).where(User.id == user.id))).scalar_one()
+        refreshed_user = (
+            await session.execute(select(User).where(User.id == user.id))
+        ).scalar_one()
         assert refreshed_user.last_email_digest_sent_on == sent_on

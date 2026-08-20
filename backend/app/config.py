@@ -47,6 +47,9 @@ class Settings(BaseSettings):
 
     fast_lane_interval_minutes: int = 2
     slow_lane_interval_minutes: int = 15
+    profile_backfill_interval_minutes: int = 1
+    profile_backfill_max_users_per_cycle: int = 5
+    profile_backfill_max_postings_per_user: int = 300
     digest_hours: str = "8,20"  # comma-separated hours (local time) for the digest cron
     daily_email_hour: int = 8
     scheduler_timezone: str = "America/New_York"
@@ -77,7 +80,11 @@ class Settings(BaseSettings):
 
     @property
     def frontend_origin_list(self) -> list[str]:
-        return [origin.strip() for origin in self.frontend_origins.split(",") if origin.strip()]
+        return [
+            origin.strip()
+            for origin in self.frontend_origins.split(",")
+            if origin.strip()
+        ]
 
 
 settings = Settings()

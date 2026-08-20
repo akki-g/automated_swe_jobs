@@ -32,6 +32,10 @@ Full design: `docs/superpowers/specs/2026-08-07-automated-swe-jobs-design.md`.
   due check catches up after restarts. The legacy 08:00/20:00 SMS digest
   remains separate. Delivery state is channel-aware, so delivery on one
   channel does not suppress another.
+- **New-profile backfill:** a completed profile is matched within about a
+  minute against a bounded window of recent open jobs already in the database.
+  Failed or partial ranking calls leave the profile pending for retry, and
+  pair-level deduplication prevents repeated matches.
 - **Workday:** 14 live-verified Workday boards expand the curated source set
   across banking, investing, consulting, consumer goods, retail, payments,
   media, and generalist employers. Workday enforces 20 results per page, so
@@ -46,17 +50,30 @@ Full design: `docs/superpowers/specs/2026-08-07-automated-swe-jobs-design.md`.
 Implementation decisions and staging are recorded in
 `docs/superpowers/plans/2026-08-08-web-onboarding-and-daily-email-plan.md`.
 
+### Live source coverage audit (2026-08-20)
+
+The 69 configured reliable and best-effort feeds returned 22,174 deduplicated
+postings in a live sweep. Of those, 5,188 were classified as internships or
+new-grad/entry-level roles across 1,792 companies. A conservative title-term
+audit found coverage in every selectable field: software 2,575 / 1,006
+companies, data 1,676 / 754, product 120 / 76, finance 192 / 101, consulting
+65 / 39, marketing 100 / 47, sales 76 / 40, operations 121 / 74, and design
+190 / 83. Counts are posting/company respectively and will change as boards
+change; the target-field coverage test ensures every taxonomy value retains a
+configured category feed.
+
 ## What's built (working MVP)
 
 This implements the spec's full Phase 1 build order (steps 1–6), plus a
 post-review hardening pass and a new company-watchlist feature.
 
-- **Sources** (`app/sources/`): SimplifyJobs New-Grad-Positions and
-  Summer-Internships GitHub lists; Greenhouse/Lever/Ashby/Workday ATS adapters driven
+- **Sources** (`app/sources/`): SimplifyJobs New-Grad-Positions and active
+  Summer 2027 Internships GitHub lists; Greenhouse/Lever/Ashby/Workday ATS adapters driven
   by a curated `companies.yaml` — **46 companies**, every entry live-verified
   against the provider's real public API during this build (see "Testing"
-  below); a generic RSS/JSON aggregator adapter (`RssFeedSource`,
-  unconfigured by default — add a feed URL to use it). All reliable-tier
+  below); a generic RSS/JSON aggregator adapter (`RssFeedSource`); and 21
+  PagesXYZ category feeds spanning every supported target field when
+  `PAGESXYZ_API_KEY` is configured. All reliable-tier
   sources implement `check_for_changes()` for the fast lane.
   LinkedIn/Indeed exist only as inert placeholder classes — see "Deliberately
   not built" below.
@@ -96,12 +113,13 @@ post-review hardening pass and a new company-watchlist feature.
   criteria filters, but are always instant-priority once matched. If no
   board is found, the user is told rather than the system silently doing
   nothing.
-- **Scheduler** (`app/scheduler.py`): four independent APScheduler jobs —
+- **Scheduler** (`app/scheduler.py`): five independent APScheduler jobs —
   `fast_lane_cycle` (~2 min, reliable-tier + watchlist sources,
   change-detection first), `slow_lane_cycle` (~15 min, full sweep +
-  staleness marking, the correctness backstop), the legacy `digest_cycle`
-  (SMS at 8am/8pm), and `daily_email_cycle` (per-user email time) — all delivery is
-  decoupled from scrape cadence.
+  staleness marking, the correctness backstop), `profile_backfill_cycle`
+  (~1 min), the legacy `digest_cycle` (SMS at 8am/8pm), and
+  `daily_email_cycle` (per-user email time) — all delivery is decoupled from
+  scrape cadence.
 - **DB** (`app/db/`): `users`, `criteria`, `postings`, `matches`, `messages`,
   `watchlist` via SQLAlchemy async + `create_all` (no Alembic, matching
   Posted's convention). A narrow idempotent startup migration adds the web
@@ -129,7 +147,8 @@ as opposed to the correctness gaps in the section below:
   `SELECT * FROM postings` on every ~2 min fast-lane and ~15 min slow-lane
   tick, against a table that only grows (9,810+ rows in one live run
   already). Fixed by scoping the existence check to the batch's own
-  posting_keys (`WHERE posting_key IN (...)`, index-backed).
+  posting_keys (`WHERE posting_key IN (...)`, index-backed and chunked for
+  large multi-category sweeps).
 - **Per-user Claude ranking calls ran one at a time**, and the fast lane
   fell back to the same per-user batching as the slow lane instead of the
   spec's per-posting-across-users batching for that lane. A cycle with N
@@ -221,10 +240,11 @@ the spec's stated guarantees; all are fixed and covered by regression tests
   want it revisited. The same reasoning extends to watchlist detection:
   it only ever probes the three real ATS APIs, never generic career-page
   scraping.
-- **Aggregator feeds are unconfigured.** `RssFeedSource` is implemented and
-  unit-tested against a fixture, but no real feed URL is wired in — I didn't
-  have a specific one to point at. Add one via `default_sources()` when you
-  have a URL in mind.
+- **Generic RSS feeds are unconfigured.** `RssFeedSource` is implemented and
+  unit-tested against a fixture, but no arbitrary RSS URL is wired in. The
+  PagesXYZ best-effort tier is configured across software, data, product,
+  finance, consulting, marketing, sales, operations, and design when its
+  publishable API key is present.
 - **A2P 10DLC registration and Phase 2 multi-user rollout** — explicitly a
   Phase 2 gate per the spec, not part of this iteration.
 - **Telnyx** — SignalWire only, per the spec's phasing.

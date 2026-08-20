@@ -10,7 +10,9 @@ def companies_yaml(tmp_path):
     return path
 
 
-def test_ensure_curated_sources_is_idempotent_and_returns_same_instances(companies_yaml):
+def test_ensure_curated_sources_is_idempotent_and_returns_same_instances(
+    companies_yaml,
+):
     reg = SourceRegistry()
 
     from app.sources.ats import build_ats_sources
@@ -62,7 +64,9 @@ async def test_check_for_changes_state_persists_across_registry_calls(monkeypatc
     source_first = reg.get_or_create_ats_source("greenhouse", "acme")
     changed_first = await source_first.check_for_changes()
 
-    source_second = reg.get_or_create_ats_source("greenhouse", "acme")  # same board, later tick
+    source_second = reg.get_or_create_ats_source(
+        "greenhouse", "acme"
+    )  # same board, later tick
     changed_second = await source_second.check_for_changes()
 
     assert source_first is source_second
@@ -103,6 +107,12 @@ def test_aggregator_sources_empty_when_no_pagesxyz_key_configured(monkeypatch):
 
 
 def test_aggregator_sources_includes_pagesxyz_when_key_configured(monkeypatch):
+    from app.domain.models import TargetField
+    from app.sources.aggregators import (
+        PAGESXYZ_CATEGORIES,
+        PAGESXYZ_CATEGORIES_BY_FIELD,
+        PAGESXYZ_LIMIT_PER_CATEGORY,
+    )
     from app.sources import registry as registry_module
 
     monkeypatch.setattr(registry_module.settings, "pagesxyz_api_key", "test-key")
@@ -110,11 +120,17 @@ def test_aggregator_sources_includes_pagesxyz_when_key_configured(monkeypatch):
 
     sources = reg.aggregator_sources()
 
-    assert len(sources) == 1
-    assert sources[0].name == "pagesxyz:software-engineering"
+    assert len(sources) == len(PAGESXYZ_CATEGORIES)
+    assert {source.name for source in sources} == {
+        f"pagesxyz:{category}" for category in PAGESXYZ_CATEGORIES
+    }
+    assert set(PAGESXYZ_CATEGORIES_BY_FIELD) == set(TargetField)
+    assert {source.limit for source in sources} == {PAGESXYZ_LIMIT_PER_CATEGORY}
 
 
-def test_aggregator_sources_never_leak_into_reliable_tier_sources(monkeypatch, companies_yaml):
+def test_aggregator_sources_never_leak_into_reliable_tier_sources(
+    monkeypatch, companies_yaml
+):
     """The fast lane calls reliable_tier_sources(); a best-effort aggregator
     must never appear there regardless of call order."""
     from app.sources import registry as registry_module
