@@ -1,7 +1,7 @@
 from datetime import UTC, datetime
 
 from app.domain.models import Criteria, Posting, RoleType
-from app.matching.filters import matches_criteria
+from app.matching.filters import criteria_mismatch_reason, matches_criteria
 
 
 def _posting(**overrides) -> Posting:
@@ -51,6 +51,58 @@ def test_location_filter_excludes_no_match():
     posting = _posting(location="Seattle, WA")
     criteria = _criteria(locations=("new york",))
     assert matches_criteria(posting, criteria) is False
+
+
+def test_united_states_preference_matches_city_and_state_abbreviation():
+    criteria = _criteria(locations=("United States",))
+
+    assert matches_criteria(_posting(location="Seattle, WA"), criteria) is True
+    assert matches_criteria(_posting(location="San Jose, CA"), criteria) is True
+
+
+def test_united_states_preference_matches_us_alias_and_bare_remote():
+    criteria = _criteria(locations=("United States",))
+
+    assert matches_criteria(_posting(location="Remote in USA"), criteria) is True
+    assert matches_criteria(_posting(location="Remote"), criteria) is True
+
+
+def test_united_states_preference_matches_common_feed_city_shorthand():
+    criteria = _criteria(locations=("United States",))
+
+    assert matches_criteria(_posting(location="NYC"), criteria) is True
+    assert matches_criteria(_posting(location="SF; NYC"), criteria) is True
+
+
+def test_united_states_preference_rejects_foreign_location():
+    criteria = _criteria(locations=("United States",))
+
+    assert matches_criteria(_posting(location="Toronto, ON, Canada"), criteria) is False
+    assert matches_criteria(_posting(location="Remote in Canada"), criteria) is False
+
+
+def test_state_name_and_abbreviation_are_equivalent():
+    assert (
+        matches_criteria(
+            _posting(location="San Jose, CA"),
+            _criteria(locations=("California",)),
+        )
+        is True
+    )
+    assert (
+        matches_criteria(
+            _posting(location="Los Angeles, California"),
+            _criteria(locations=("CA",)),
+        )
+        is True
+    )
+
+
+def test_mismatch_reason_identifies_location_before_ranking():
+    posting = _posting(location="Toronto, ON, Canada")
+    criteria = _criteria(locations=("United States",))
+
+    assert criteria_mismatch_reason(posting, criteria) == "location"
 
 
 def test_keyword_filter_matches_title_or_company():

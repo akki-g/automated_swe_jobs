@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from collections import Counter
 from dataclasses import dataclass, field
 from datetime import UTC, date, datetime, timedelta
+from statistics import median
 
 import httpx
 from sqlalchemy import or_, select, update
@@ -20,7 +22,7 @@ from app.domain.models import Criteria, Posting, Priority, RoleType, TargetField
 from app.ingest.dedupe import dedupe_postings, filter_new
 from app.ingest.link_check import check_link_alive
 from app.ingest.normalize import extract_description, normalize, normalize_company_key
-from app.matching.filters import filter_postings
+from app.matching.filters import criteria_mismatch_reason
 from app.matching.rank import AnthropicClient, compute_priority, rank_postings
 from app.notify.dispatch import DigestItem
 from app.sources.base import Source
@@ -396,11 +398,34 @@ async def match_new_postings(
                 continue
             criteria = _criteria_row_to_domain(criteria_row)
             already_matched = existing_match_keys_by_user.get(user.id, set())
-            survivors = [
-                posting
-                for posting in filter_postings(postings_domain, criteria)
-                if posting.posting_key not in already_matched
-            ]
+            rejection_counts: Counter[str] = Counter()
+            survivors: list[Posting] = []
+            already_matched_count = 0
+            for posting in postings_domain:
+                if posting.posting_key in already_matched:
+                    already_matched_count += 1
+                    continue
+                mismatch_reason = criteria_mismatch_reason(posting, criteria)
+                if mismatch_reason is not None:
+                    rejection_counts[mismatch_reason] += 1
+                    continue
+                survivors.append(posting)
+
+            logger.info(
+                "matching funnel pre-rank: lane=%s user_id=%s input=%d "
+                "already_matched=%d rejected_role=%d rejected_sponsorship=%d "
+                "rejected_date=%d rejected_location=%d rejected_keyword=%d survivors=%d",
+                lane,
+                user.id,
+                len(postings_domain),
+                already_matched_count,
+                rejection_counts["role_type"],
+                rejection_counts["sponsorship"],
+                rejection_counts["min_date"],
+                rejection_counts["location"],
+                rejection_counts["keyword"],
+                len(survivors),
+            )
             if not survivors:
                 continue
             candidates.append((user, criteria, survivors))
@@ -441,6 +466,10 @@ async def match_new_postings(
             failed_user_ids.add(user.id)
         watched_keys = watched_by_user.get(user.id, set())
         rank_by_key = {r.posting_key: r for r in rank_results}
+        unique_scores = [result.score for result in rank_by_key.values()]
+        discarded_below_gate = 0
+        kept_watchlist_below_gate = 0
+        stored_count = 0
 
         matches_for_digest: list[tuple[MatchRow, PostingRow]] = []
         for posting in survivors:
@@ -467,7 +496,10 @@ async def match_new_postings(
                 # irrelevant. Watchlisted companies bypass this: the user
                 # explicitly asked to hear about that company regardless of
                 # score (see spec addendum: watchlist priority).
+                discarded_below_gate += 1
                 continue
+            if is_watched and rank_result.score < settings.min_match_score:
+                kept_watchlist_below_gate += 1
 
             posting_row = postings_by_key[posting.posting_key]
             priority = compute_priority(rank_result.score)
@@ -492,6 +524,7 @@ async def match_new_postings(
                 created_at=now,
             )
             session.add(match_row)
+            stored_count += 1
 
             if priority == Priority.HIGH:
                 instant.append((user, match_row, posting_row))
@@ -500,6 +533,23 @@ async def match_new_postings(
 
         if matches_for_digest:
             digest_items.append(DigestItem(user=user, matches=matches_for_digest))
+
+        logger.info(
+            "matching funnel post-rank: lane=%s user_id=%s survivors=%d returned=%d "
+            "missing=%d discarded_below_gate=%d kept_watchlist_below_gate=%d "
+            "stored=%d score_min=%s score_median=%s score_max=%s",
+            lane,
+            user.id,
+            len(survivors),
+            len(rank_by_key),
+            max(0, len(survivors) - len(rank_by_key)),
+            discarded_below_gate,
+            kept_watchlist_below_gate,
+            stored_count,
+            f"{min(unique_scores):.3f}" if unique_scores else "n/a",
+            f"{median(unique_scores):.3f}" if unique_scores else "n/a",
+            f"{max(unique_scores):.3f}" if unique_scores else "n/a",
+        )
 
     await session.flush()
     return MatchCycleResult(
