@@ -594,11 +594,30 @@ async def backfill_completed_profiles(
                 .where(
                     User.password_hash.is_not(None),
                     User.profile_completed_at.is_not(None),
-                    User.initial_match_backfill_version < _PROFILE_BACKFILL_VERSION,
+                    or_(
+                        User.initial_match_backfill_version
+                        < _PROFILE_BACKFILL_VERSION,
+                        # This column is added as false on deployment. Even a
+                        # profile that phase 3 already marked complete gets
+                        # one corrected newest-first page, so accounts that
+                        # completed under the broken literal location filter
+                        # are repaired without forcing another full-corpus
+                        # scan of every legacy user.
+                        User.initial_match_backfill_recent_seeded.is_(False),
+                    ),
                     User.opted_out.is_(False),
                 )
                 .options(selectinload(User.criteria))
-                .order_by(User.profile_completed_at.asc(), User.id.asc())
+                # Fair round-robin: never-attempted profiles go first, newest
+                # signup first within that group, then whichever profile has
+                # waited longest since its last page. The old oldest-signup-
+                # first order let the same N long scans occupy every slot and
+                # starved all newer users indefinitely.
+                .order_by(
+                    User.initial_match_backfill_last_attempted_at.asc().nullsfirst(),
+                    User.profile_completed_at.desc(),
+                    User.id.desc(),
+                )
                 .limit(settings.profile_backfill_max_users_per_cycle)
             )
         )
@@ -615,6 +634,7 @@ async def backfill_completed_profiles(
 
     page_size = settings.profile_backfill_max_postings_per_user
     for user in pending_users:
+        user.initial_match_backfill_last_attempted_at = datetime.now(UTC)
         # Each profile walks its own cursor, so profiles that joined at
         # different times can be mid-scan at different offsets without
         # interfering. Ordered by id (monotonic per insert) rather than
@@ -623,7 +643,6 @@ async def backfill_completed_profiles(
         # every page is reached eventually either way.
         page_conditions = [
             PostingRow.status == "open",
-            PostingRow.id > user.initial_match_backfill_cursor,
         ]
         # Mirror matching.filters' role-type rule in SQL so pages aren't
         # mostly rows the rule filter is about to discard — most of the
@@ -638,12 +657,25 @@ async def backfill_completed_profiles(
         if requested_role_types:
             page_conditions.append(PostingRow.role_type.in_(requested_role_types))
 
+        # Give a fresh/reset profile the newest page first so useful current
+        # matches appear on its first scheduler turn. Once seeded, resume the
+        # monotonic oldest-to-newest cursor scan that guarantees full corpus
+        # coverage. Existing mid-scan profiles receive the seed once and then
+        # continue from their prior cursor without losing progress.
+        if user.initial_match_backfill_recent_seeded:
+            page_conditions.append(
+                PostingRow.id > user.initial_match_backfill_cursor
+            )
+            page_order = PostingRow.id.asc()
+        else:
+            page_order = PostingRow.id.desc()
+
         page = (
             (
                 await session.execute(
                     select(PostingRow)
                     .where(*page_conditions)
-                    .order_by(PostingRow.id.asc())
+                    .order_by(page_order)
                     .limit(page_size)
                 )
             )
@@ -663,6 +695,7 @@ async def backfill_completed_profiles(
                     user.id,
                 )
                 continue
+            user.initial_match_backfill_recent_seeded = True
             user.initial_matches_generated_at = completed_at
             user.initial_match_backfill_version = _PROFILE_BACKFILL_VERSION
             logger.info(
@@ -702,11 +735,17 @@ async def backfill_completed_profiles(
                 _MAX_BACKFILL_ATTEMPTS,
             )
 
-        # Page dealt with (fully ranked, or given up on): advance past it and
-        # restore the budget, so attempts counts consecutive failures on the
-        # *current* page rather than accumulating across a long healthy scan.
-        user.initial_match_backfill_cursor = page[-1].id
+        # Page dealt with (fully ranked, or given up on): restore the retry
+        # budget. The seed page deliberately does not move the historical
+        # cursor; the next turn begins the full ascending scan from its prior
+        # position. Existing matches from the seed are cheaply excluded when
+        # that scan eventually overlaps them.
         user.initial_match_backfill_attempts = 0
+        was_seed_page = not user.initial_match_backfill_recent_seeded
+        if was_seed_page:
+            user.initial_match_backfill_recent_seeded = True
+        else:
+            user.initial_match_backfill_cursor = page[-1].id
 
         if len(page) < page_size:
             # A short page is the end of the corpus — no need to spend

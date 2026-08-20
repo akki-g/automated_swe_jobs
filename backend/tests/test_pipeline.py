@@ -106,6 +106,148 @@ async def _drain_backfill(session, client, *, cycles: int = 50):
 
 
 @pytest.mark.asyncio
+async def test_backfill_seeds_newest_postings_on_first_turn(
+    db_session, demo_user, monkeypatch
+):
+    """A fresh profile should not wait through the oldest corpus pages before
+    seeing current jobs. The first page is a newest-first seed; the cursor
+    scan still covers everything on later turns."""
+    monkeypatch.setattr(settings, "profile_backfill_max_postings_per_user", 2)
+    user = _completed_web_user(db_session, email="newest-first@example.com")
+    await db_session.flush()
+    db_session.add(_criteria_for(user))
+    postings = [_posting(key=f"acme|new grad swe|city{i}") for i in range(5)]
+    await store_new_postings(db_session, postings)
+    await db_session.commit()
+
+    await backfill_completed_profiles(db_session, FakeRankClient())
+    await db_session.commit()
+    await db_session.refresh(user)
+
+    matched = {
+        row.posting_key
+        for row in (
+            await db_session.execute(
+                select(PostingRow)
+                .join(MatchRow, MatchRow.posting_id == PostingRow.id)
+                .where(MatchRow.user_id == user.id)
+            )
+        )
+        .scalars()
+        .all()
+    }
+    assert matched == {postings[-1].posting_key, postings[-2].posting_key}
+    assert user.initial_match_backfill_recent_seeded is True
+    assert user.initial_match_backfill_cursor == 0
+    assert user.initial_match_backfill_version < _PROFILE_BACKFILL_VERSION
+
+
+@pytest.mark.asyncio
+async def test_backfill_scheduler_does_not_starve_new_profiles(
+    db_session, demo_user, monkeypatch
+):
+    """More pending profiles than the per-cycle cap must rotate fairly.
+
+    The production failure had six pending profiles and a cap of five. The
+    old oldest-signup-first query selected the same five on every turn while
+    their long corpus scans ran, so the newest account never got a page.
+    """
+    monkeypatch.setattr(settings, "profile_backfill_max_users_per_cycle", 2)
+    monkeypatch.setattr(settings, "profile_backfill_max_postings_per_user", 1)
+    users = []
+    for index in range(3):
+        user = _completed_web_user(db_session, email=f"round-robin-{index}@example.com")
+        user.profile_completed_at = datetime(2026, 8, 20, 12 + index, tzinfo=UTC)
+        await db_session.flush()
+        db_session.add(_criteria_for(user))
+        users.append(user)
+    await store_new_postings(
+        db_session, [_posting(key=f"acme|new grad swe|city{i}") for i in range(3)]
+    )
+    await db_session.commit()
+
+    await backfill_completed_profiles(db_session, FakeRankClient())
+    await db_session.commit()
+
+    matched_user_ids = set(
+        (
+            await db_session.execute(
+                select(MatchRow.user_id).where(
+                    MatchRow.user_id.in_([user.id for user in users])
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert matched_user_ids == {users[1].id, users[2].id}
+
+    await backfill_completed_profiles(db_session, FakeRankClient())
+    await db_session.commit()
+    matched_user_ids = set(
+        (
+            await db_session.execute(
+                select(MatchRow.user_id).where(
+                    MatchRow.user_id.in_([user.id for user in users])
+                )
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert matched_user_ids == {user.id for user in users}
+
+
+@pytest.mark.asyncio
+async def test_completed_profile_gets_one_corrected_recent_seed(
+    db_session, demo_user, monkeypatch
+):
+    """Profiles completed by phase 3 before the scheduler/location repair
+    still need one newest-page retry, but must not pay for another complete
+    historical scan."""
+    monkeypatch.setattr(settings, "profile_backfill_max_postings_per_user", 2)
+    user = _completed_web_user(db_session, email="completed-before-fix@example.com")
+    user.initial_match_backfill_version = _PROFILE_BACKFILL_VERSION
+    user.initial_matches_generated_at = datetime.now(UTC)
+    user.initial_match_backfill_recent_seeded = False
+    await db_session.flush()
+    db_session.add(_criteria_for(user))
+    postings = [_posting(key=f"acme|new grad swe|city{i}") for i in range(4)]
+    await store_new_postings(db_session, postings)
+    await db_session.commit()
+
+    await backfill_completed_profiles(db_session, FakeRankClient())
+    await db_session.commit()
+    await db_session.refresh(user)
+
+    matches = (
+        (
+            await db_session.execute(
+                select(MatchRow).where(MatchRow.user_id == user.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(matches) == 2
+    assert user.initial_match_backfill_recent_seeded is True
+    assert user.initial_match_backfill_version == _PROFILE_BACKFILL_VERSION
+
+    await backfill_completed_profiles(db_session, FakeRankClient())
+    await db_session.commit()
+    matches = (
+        (
+            await db_session.execute(
+                select(MatchRow).where(MatchRow.user_id == user.id)
+            )
+        )
+        .scalars()
+        .all()
+    )
+    assert len(matches) == 2
+
+
+@pytest.mark.asyncio
 async def test_backfill_covers_the_whole_corpus_not_just_one_page(
     db_session, demo_user, monkeypatch
 ):

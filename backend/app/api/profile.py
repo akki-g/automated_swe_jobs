@@ -164,6 +164,10 @@ async def update_profile(
         # over only the tail of the corpus, which is the signup-time bug in
         # miniature (see pipeline.backfill_completed_profiles).
         user.initial_match_backfill_cursor = 0
+        user.initial_match_backfill_recent_seeded = False
+        # Make an edited profile immediately eligible for the fair scheduler;
+        # its previous attempt time belongs to the old criteria.
+        user.initial_match_backfill_last_attempted_at = None
     criteria.role_types = [value.value for value in body.role_types]
     criteria.target_fields = [value.value for value in body.target_fields]
     criteria.keywords = body.keywords

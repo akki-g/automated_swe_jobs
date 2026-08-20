@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from datetime import UTC, datetime
 from io import BytesIO
 
 import httpx
@@ -147,6 +148,8 @@ async def test_editing_criteria_restores_the_backfill_retry_budget(web_app):
             user.initial_match_backfill_attempts = 5
             user.initial_match_backfill_version = 3
             user.initial_match_backfill_cursor = 9999
+            user.initial_match_backfill_recent_seeded = True
+            user.initial_match_backfill_last_attempted_at = datetime.now(UTC)
             await session.commit()
 
         edited = await client.put(
@@ -164,6 +167,8 @@ async def test_editing_criteria_restores_the_backfill_retry_budget(web_app):
         # to ask of the corpus, so postings already scanned under the old
         # criteria have to be reconsidered for parity to hold after an edit.
         assert user.initial_match_backfill_cursor == 0
+        assert user.initial_match_backfill_recent_seeded is False
+        assert user.initial_match_backfill_last_attempted_at is None
 
 
 @pytest.mark.asyncio

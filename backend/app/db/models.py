@@ -66,6 +66,18 @@ class User(Base):
     # depend on its criteria rather than on when it signed up — see
     # pipeline.backfill_completed_profiles.
     initial_match_backfill_cursor: Mapped[int] = mapped_column(Integer, default=0)
+    # The historical scan starts with one newest-first seed page so a fresh
+    # profile gets useful current results immediately, then continues through
+    # the full corpus using the cursor above.
+    initial_match_backfill_recent_seeded: Mapped[bool] = mapped_column(
+        Boolean, default=False
+    )
+    # Used for round-robin scheduling. Ordering only by profile creation time
+    # let the oldest N profiles occupy every limited scheduler slot until
+    # their multi-page scans finished, starving every newer signup.
+    initial_match_backfill_last_attempted_at: Mapped[datetime | None] = mapped_column(
+        DateTime(timezone=True), nullable=True
+    )
     email_digest_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     email_digest_time: Mapped[str] = mapped_column(String(5), default="08:00")
     last_email_digest_sent_on: Mapped[date | None] = mapped_column(Date, nullable=True)

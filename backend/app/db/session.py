@@ -47,6 +47,8 @@ def _ensure_web_profile_columns(connection) -> None:
         "initial_match_backfill_version": "INTEGER NOT NULL DEFAULT 0",
         "initial_match_backfill_attempts": "INTEGER NOT NULL DEFAULT 0",
         "initial_match_backfill_cursor": "INTEGER NOT NULL DEFAULT 0",
+        "initial_match_backfill_recent_seeded": "BOOLEAN NOT NULL DEFAULT false",
+        "initial_match_backfill_last_attempted_at": "TIMESTAMP WITH TIME ZONE",
         "email_digest_enabled": "BOOLEAN NOT NULL DEFAULT true",
         "email_digest_time": "VARCHAR(5) NOT NULL DEFAULT '08:00'",
         "last_email_digest_sent_on": "DATE",
@@ -117,6 +119,7 @@ def _ensure_web_profile_columns(connection) -> None:
         for table, column in (
             ("users", "profile_completed_at"),
             ("users", "initial_matches_generated_at"),
+            ("users", "initial_match_backfill_last_attempted_at"),
             ("users", "matches_last_viewed_at"),
             ("users", "matches_visit_started_at"),
             ("criteria", "resume_updated_at"),
