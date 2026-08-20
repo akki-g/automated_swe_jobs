@@ -63,6 +63,205 @@ class EmptyRankClient:
         }
 
 
+class PermanentlyPartialRankClient:
+    """Scores every posting except one, on every call.
+
+    Distinct from a transient failure: retrying can never improve coverage,
+    so a retry policy that demands complete coverage will retry forever.
+    """
+
+    def __init__(self, omit_key: str) -> None:
+        self.omit_key = omit_key
+        self.calls = 0
+
+    async def create_message(self, *, system, messages, tools):
+        self.calls += 1
+        keys = re.findall(r'"posting_key":\s*"([^"]+)"', messages[0]["content"])
+        results = [
+            {"posting_key": key, "score": 0.6, "blurb": "ok"}
+            for key in keys
+            if key != self.omit_key
+        ]
+        return {
+            "content": [
+                {"type": "tool_use", "name": tools[0]["name"], "input": {"results": results}}
+            ]
+        }
+
+
+@pytest.mark.asyncio
+async def test_profile_backfill_stops_retrying_a_permanently_partial_ranking(
+    db_session, demo_user
+):
+    """A profile must not be pinned in the retry loop forever.
+
+    Completion required a rank result for *every* survivor, but a posting the
+    model simply never returns a result for makes that unreachable: the
+    profile stays pending and every one-minute cycle re-ranks its whole
+    inventory again. That is the state the max_tokens truncation bug put real
+    users into (it made coverage permanently zero), and it is what filled the
+    logs with "maximum number of running instances reached". Recovering from
+    transient failures must not mean retrying a permanent one indefinitely.
+    """
+    demo_user.password_hash = "argon2-placeholder"
+    demo_user.profile_completed_at = datetime.now(UTC)
+    db_session.add(
+        CriteriaRow(
+            user_id=demo_user.id,
+            role_types=["new_grad"],
+            target_fields=["software_engineering"],
+            keywords=[],
+            locations=[],
+            sponsorship_required=None,
+            freeform_notes="",
+            updated_at=datetime.now(UTC),
+        )
+    )
+    scored = _posting(key="acme|new grad swe|remote")
+    never_scored = _posting(key="acme|backend engineer|nyc")
+    await store_new_postings(db_session, [scored, never_scored])
+    await db_session.commit()
+
+    client = PermanentlyPartialRankClient(omit_key=never_scored.posting_key)
+    for _ in range(12):
+        await backfill_completed_profiles(db_session, client)
+        await db_session.commit()
+
+    await db_session.refresh(demo_user)
+    assert demo_user.initial_match_backfill_version == 2
+    assert demo_user.initial_matches_generated_at is not None
+
+
+@pytest.mark.asyncio
+async def test_waiting_for_inventory_never_burns_the_retry_budget(
+    db_session, demo_user
+):
+    """The retry bound must not resurrect the bug it sits next to.
+
+    A fresh deployment runs this cycle every minute while the first slow-lane
+    scrape (15 min) is still pending, so a profile can see many empty cycles
+    before any inventory exists. Those must not count as attempts — if they
+    did, the profile would exhaust its budget against an empty database and
+    be marked complete with no matches at all, which is exactly the v1 bug
+    _PROFILE_BACKFILL_VERSION 2 exists to undo.
+    """
+    demo_user.password_hash = "argon2-placeholder"
+    demo_user.profile_completed_at = datetime.now(UTC)
+    db_session.add(
+        CriteriaRow(
+            user_id=demo_user.id,
+            role_types=["new_grad"],
+            target_fields=["software_engineering"],
+            keywords=[],
+            locations=[],
+            sponsorship_required=None,
+            freeform_notes="",
+            updated_at=datetime.now(UTC),
+        )
+    )
+    await db_session.commit()
+
+    for _ in range(12):
+        await backfill_completed_profiles(db_session, FakeRankClient())
+        await db_session.commit()
+
+    await db_session.refresh(demo_user)
+    assert demo_user.initial_match_backfill_version == 0
+    assert demo_user.initial_matches_generated_at is None
+
+    # Inventory finally lands: the profile still has its full budget and
+    # backfills normally.
+    await store_new_postings(db_session, [_posting()])
+    await db_session.commit()
+    result = await backfill_completed_profiles(db_session, FakeRankClient())
+    await db_session.commit()
+
+    assert len(result.digest_items) == 1
+    await db_session.refresh(demo_user)
+    assert demo_user.initial_match_backfill_version == 2
+
+
+@pytest.mark.asyncio
+async def test_profile_backfill_keeps_matches_it_did_manage_to_score(
+    db_session, demo_user
+):
+    """Giving up on the unscorable posting must not cost the user the
+    matches that did rank — those are the whole point of the backfill."""
+    demo_user.password_hash = "argon2-placeholder"
+    demo_user.profile_completed_at = datetime.now(UTC)
+    db_session.add(
+        CriteriaRow(
+            user_id=demo_user.id,
+            role_types=["new_grad"],
+            target_fields=["software_engineering"],
+            keywords=[],
+            locations=[],
+            sponsorship_required=None,
+            freeform_notes="",
+            updated_at=datetime.now(UTC),
+        )
+    )
+    scored = _posting(key="acme|new grad swe|remote")
+    never_scored = _posting(key="acme|backend engineer|nyc")
+    await store_new_postings(db_session, [scored, never_scored])
+    await db_session.commit()
+
+    client = PermanentlyPartialRankClient(omit_key=never_scored.posting_key)
+    for _ in range(12):
+        await backfill_completed_profiles(db_session, client)
+        await db_session.commit()
+
+    matched_keys = {
+        row.posting_key
+        for row in (
+            await db_session.execute(
+                select(PostingRow).join(MatchRow, MatchRow.posting_id == PostingRow.id)
+            )
+        )
+        .scalars()
+        .all()
+    }
+    assert matched_keys == {scored.posting_key}
+
+
+@pytest.mark.asyncio
+async def test_profile_backfill_stops_re_ranking_once_it_gives_up(
+    db_session, demo_user
+):
+    """The cost half of the same bug: a pinned profile re-ranked its whole
+    inventory every single cycle. Once the backfill gives up, further cycles
+    must not keep calling the ranker for that user."""
+    demo_user.password_hash = "argon2-placeholder"
+    demo_user.profile_completed_at = datetime.now(UTC)
+    db_session.add(
+        CriteriaRow(
+            user_id=demo_user.id,
+            role_types=["new_grad"],
+            target_fields=["software_engineering"],
+            keywords=[],
+            locations=[],
+            sponsorship_required=None,
+            freeform_notes="",
+            updated_at=datetime.now(UTC),
+        )
+    )
+    scored = _posting(key="acme|new grad swe|remote")
+    never_scored = _posting(key="acme|backend engineer|nyc")
+    await store_new_postings(db_session, [scored, never_scored])
+    await db_session.commit()
+
+    client = PermanentlyPartialRankClient(omit_key=never_scored.posting_key)
+    for _ in range(12):
+        await backfill_completed_profiles(db_session, client)
+        await db_session.commit()
+    calls_after_giving_up = client.calls
+
+    await backfill_completed_profiles(db_session, client)
+    await db_session.commit()
+
+    assert client.calls == calls_after_giving_up
+
+
 @pytest.mark.asyncio
 async def test_completed_web_profile_is_backfilled_from_existing_open_postings(
     db_session, demo_user

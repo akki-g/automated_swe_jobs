@@ -54,6 +54,12 @@ class User(Base):
     # Versioned separately from the timestamp so a corrected backfill can
     # safely reprocess profiles whose older run incorrectly marked success.
     initial_match_backfill_version: Mapped[int] = mapped_column(Integer, default=0)
+    # How many times the backfill has ranked this profile's inventory without
+    # covering every survivor. Retrying recovers from transient ranking
+    # failures, but some postings never get a result no matter how often they
+    # are sent, so retries need a bound — see
+    # pipeline._MAX_BACKFILL_ATTEMPTS.
+    initial_match_backfill_attempts: Mapped[int] = mapped_column(Integer, default=0)
     email_digest_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     email_digest_time: Mapped[str] = mapped_column(String(5), default="08:00")
     last_email_digest_sent_on: Mapped[date | None] = mapped_column(Date, nullable=True)

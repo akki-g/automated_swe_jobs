@@ -154,6 +154,11 @@ async def update_profile(
         # rows rather than duplicating prior results.
         user.initial_matches_generated_at = None
         user.initial_match_backfill_version = 0
+        # New criteria are a new ranking problem, so the previous run's
+        # retry budget must not carry over — an exhausted count would make
+        # the re-run give up on its first cycle (see
+        # pipeline._MAX_BACKFILL_ATTEMPTS).
+        user.initial_match_backfill_attempts = 0
     criteria.role_types = [value.value for value in body.role_types]
     criteria.target_fields = [value.value for value in body.target_fields]
     criteria.keywords = body.keywords

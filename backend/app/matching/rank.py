@@ -22,6 +22,23 @@ logger = logging.getLogger(__name__)
 # other half of this fix: making that case loud instead of silent).
 _RANK_BATCH_SIZE = 20
 
+# Worst-case output tokens for one result object, used to size
+# _RANK_MAX_TOKENS against a full batch. Derived from the schema's own
+# limits rather than measured averages, because it's the worst case that
+# truncates: posting_key is company|title|location with each component
+# capped at ingest/normalize.py::_MAX_COMPONENT_LENGTH (150), and blurb is
+# capped at 300 characters where it's parsed below — roughly 190 tokens of
+# text at ~4 chars/token, plus JSON punctuation, key names, score, and
+# target_field.
+_MAX_EXPECTED_RESULT_TOKENS = 220
+
+# Output budget per call. Must cover a full batch of worst-case results
+# (asserted in tests/test_rank.py) — the previous value of 2048 covered only
+# about nine, so any full batch truncated and returned nothing. Truncation
+# is still handled gracefully at runtime (see _rank_chunk), but it costs an
+# extra round-trip, so the budget should make it rare rather than routine.
+_RANK_MAX_TOKENS = 8192
+
 # Bounds how many chunk-scoring calls run at once, independent of the
 # per-user concurrency bound in pipeline.py's _RANK_CONCURRENCY — a single
 # user with a very large survivor set now fans out into multiple chunk
@@ -101,7 +118,7 @@ class AnthropicMessagesClient:
     async def create_message(self, *, system: str, messages: list[dict], tools: list[dict]) -> dict:
         response = await self._client.messages.create(
             model=self._model,
-            max_tokens=2048,
+            max_tokens=_RANK_MAX_TOKENS,
             system=system,
             messages=messages,
             tools=tools,
@@ -161,9 +178,11 @@ def _build_prompt(postings: list[Posting], criteria: Criteria) -> tuple[str, lis
 
 async def _rank_batch(
     postings: list[Posting], criteria: Criteria, client: AnthropicClient
-) -> list[RankResult]:
+) -> tuple[list[RankResult], bool]:
     """Score one chunk (<= _RANK_BATCH_SIZE postings) in a single Claude
-    call."""
+    call. Returns the parsed results and whether the response was cut off by
+    max_tokens (which _rank_chunk uses to decide whether to retry smaller —
+    see _rank_chunk)."""
     system, messages = _build_prompt(postings, criteria)
     try:
         async with _CHUNK_CONCURRENCY:
@@ -171,7 +190,7 @@ async def _rank_batch(
         tool_input = _extract_tool_input(response, RANK_TOOL["name"])
     except Exception:  # noqa: BLE001 - a ranking failure must not crash the cycle
         logger.warning("rank_postings: LLM call failed for user_id=%s", criteria.user_id, exc_info=True)
-        return []
+        return [], False
 
     # The user's own selected fields are the only valid tags — Claude
     # occasionally free-associates a field the user never chose (or
@@ -215,15 +234,43 @@ async def _rank_batch(
     # results than postings sent in, and nothing above would otherwise catch
     # it. Surface it loudly: a silently-truncated batch previously looked
     # identical to "the model scored everything below the threshold."
-    if response.get("stop_reason") == "max_tokens":
+    truncated = response.get("stop_reason") == "max_tokens"
+    if truncated:
         logger.warning(
             "rank_postings: response truncated by max_tokens for user_id=%s "
-            "(%d postings sent, %d results parsed) — consider lowering _RANK_BATCH_SIZE",
+            "(%d postings sent, %d results parsed) — retrying in smaller pieces",
             criteria.user_id,
             len(postings),
             len(results),
         )
-    return results
+    return results, truncated
+
+
+async def _rank_chunk(
+    postings: list[Posting], criteria: Criteria, client: AnthropicClient
+) -> list[RankResult]:
+    """Score one chunk, splitting and retrying if the response was truncated.
+
+    A static _RANK_BATCH_SIZE can only ever be a guess: output length scales
+    with how much the model writes per posting, which drifts whenever the
+    prompt or blurb instructions change (adding posting descriptions to the
+    payload is what pushed real batches over the limit and left new users at
+    zero matches). Rather than trust the guess, treat truncation as a signal
+    and re-score the same postings as two halves, each of which asks for half
+    as much output. This converges: every level halves the chunk, and a
+    single posting that still truncates is given up on rather than split
+    further. Halves partition the chunk, so no posting is scored twice.
+    """
+    results, truncated = await _rank_batch(postings, criteria, client)
+    if not truncated or len(postings) <= 1:
+        return results
+
+    midpoint = len(postings) // 2
+    halves = await asyncio.gather(
+        _rank_chunk(postings[:midpoint], criteria, client),
+        _rank_chunk(postings[midpoint:], criteria, client),
+    )
+    return [result for half in halves for result in half]
 
 
 async def rank_postings(
@@ -232,12 +279,13 @@ async def rank_postings(
     """Batch-score postings for one user's criteria (see spec: Matching —
     slow lane batches per user). Chunked into groups of at most
     _RANK_BATCH_SIZE so a large survivor set can't silently truncate a single
-    huge call (see _RANK_BATCH_SIZE); chunks are scored concurrently."""
+    huge call (see _RANK_BATCH_SIZE); chunks are scored concurrently, and any
+    chunk that still truncates is split and retried (see _rank_chunk)."""
     if not postings:
         return []
 
     chunks = [postings[i : i + _RANK_BATCH_SIZE] for i in range(0, len(postings), _RANK_BATCH_SIZE)]
-    chunk_results = await asyncio.gather(*(_rank_batch(chunk, criteria, client) for chunk in chunks))
+    chunk_results = await asyncio.gather(*(_rank_chunk(chunk, criteria, client) for chunk in chunks))
     return [result for results in chunk_results for result in results]
 
 

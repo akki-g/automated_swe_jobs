@@ -1,11 +1,14 @@
 import json
+from collections import Counter
 from datetime import UTC, datetime
 
 import pytest
 
 from app.domain.models import Criteria, Posting, Priority, RoleType, TargetField
 from app.matching.rank import (
+    _MAX_EXPECTED_RESULT_TOKENS,
     _RANK_BATCH_SIZE,
+    _RANK_MAX_TOKENS,
     _build_prompt,
     compute_priority,
     rank_postings,
@@ -71,6 +74,26 @@ class TruncatedAnthropicClient:
             "stop_reason": "max_tokens",
             "content": [{"type": "tool_use", "name": tools[0]["name"], "input": {"results": []}}],
         }
+
+
+class BisectingTruncationClient:
+    """Truncates (stop_reason=max_tokens, zero results) any call sent more
+    than one posting; scores normally otherwise. Proves a truncated batch
+    gets retried as smaller sub-batches instead of being dropped to zero."""
+
+    def __init__(self) -> None:
+        self.batch_sizes: list[int] = []
+
+    async def create_message(self, *, system, messages, tools):
+        payload = json.loads(messages[0]["content"].split("Candidate postings: ", 1)[1].split("\n\n")[0])
+        self.batch_sizes.append(len(payload))
+        if len(payload) > 1:
+            return {
+                "stop_reason": "max_tokens",
+                "content": [{"type": "tool_use", "name": tools[0]["name"], "input": {"results": []}}],
+            }
+        results = [{"posting_key": p["posting_key"], "score": 0.5, "blurb": "ok"} for p in payload]
+        return {"content": [{"type": "tool_use", "name": tools[0]["name"], "input": {"results": results}}]}
 
 
 @pytest.mark.asyncio
@@ -157,6 +180,56 @@ async def test_rank_postings_reports_but_does_not_crash_on_truncated_response(ca
 
     assert results == []
     assert any("truncated" in record.message for record in caplog.records)
+
+
+@pytest.mark.asyncio
+async def test_truncated_batch_is_retried_in_smaller_pieces():
+    """Regression for new users getting zero matches: a full-size chunk whose
+    response is cut off by max_tokens must be re-scored as smaller sub-batches
+    rather than dropped wholesale. Dropping it lost every posting in the chunk,
+    and since a profile backfill rebuilds the identical chunk next cycle, the
+    user stayed at zero matches indefinitely."""
+    postings = [_posting(posting_key=f"k{i}") for i in range(8)]
+    client = BisectingTruncationClient()
+    criteria = Criteria(user_id=1)
+
+    results = await rank_postings(postings, criteria, client)
+
+    assert {r.posting_key for r in results} == {p.posting_key for p in postings}
+
+
+@pytest.mark.asyncio
+async def test_truncation_retry_gives_up_on_a_single_posting():
+    """A lone posting that still truncates cannot be split further — it must
+    return empty rather than recurse forever."""
+    postings = [_posting(posting_key="k1")]
+    criteria = Criteria(user_id=1)
+
+    results = await rank_postings(postings, criteria, TruncatedAnthropicClient())
+
+    assert results == []
+
+
+@pytest.mark.asyncio
+async def test_truncation_retry_does_not_duplicate_scored_postings():
+    """Splitting must partition the chunk, not overlap it — a duplicated
+    posting_key would violate the unique (user_id, posting_id) match
+    constraint downstream in pipeline.match_new_postings."""
+    postings = [_posting(posting_key=f"k{i}") for i in range(8)]
+    criteria = Criteria(user_id=1)
+
+    results = await rank_postings(postings, criteria, BisectingTruncationClient())
+
+    assert Counter(r.posting_key for r in results).most_common(1)[0][1] == 1
+
+
+def test_rank_max_tokens_fits_a_full_batch_of_worst_case_results():
+    """The output budget must cover a full _RANK_BATCH_SIZE batch where every
+    result is as long as the schema allows. Violating this is what made new
+    users get zero matches: every full batch truncated, and each retry cycle
+    rebuilt the same oversized request. Raising _RANK_BATCH_SIZE without
+    raising _RANK_MAX_TOKENS (or vice versa) must fail here."""
+    assert _RANK_MAX_TOKENS >= _RANK_BATCH_SIZE * _MAX_EXPECTED_RESULT_TOKENS
 
 
 def test_compute_priority_high_above_threshold():

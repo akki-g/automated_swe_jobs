@@ -54,6 +54,7 @@ def test_web_profile_schema_upgrade_is_additive_and_idempotent():
             "profile_completed_at",
             "initial_matches_generated_at",
             "initial_match_backfill_version",
+            "initial_match_backfill_attempts",
             "email_digest_enabled",
             "email_digest_time",
             "last_email_digest_sent_on",

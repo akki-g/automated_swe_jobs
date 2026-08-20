@@ -34,6 +34,19 @@ _POSTING_KEY_QUERY_BATCH_SIZE = 5_000
 # non-empty inventory was actually considered without ranking failures.
 _PROFILE_BACKFILL_VERSION = 2
 
+# How many times a profile may be ranked without full coverage before the
+# backfill accepts what it got and stops retrying. Retrying is what recovers
+# a profile from a transient ranking failure (an API error, or the
+# max_tokens truncation that returned zero results for a whole batch), and
+# those clear within a cycle or two. A posting the model never returns a
+# result for does not clear, and demanding complete coverage pinned such a
+# profile in the retry loop forever: never marked complete, re-ranking its
+# whole inventory every single cycle. Bounding the retries keeps the
+# recovery while making the pathological case terminate. Only cycles that
+# actually ranked something count (see backfill_completed_profiles), so
+# waiting for the first scrape to land never burns an attempt.
+_MAX_BACKFILL_ATTEMPTS = 5
+
 
 @dataclass
 class MatchCycleResult:
@@ -571,14 +584,32 @@ async def backfill_completed_profiles(
     )
     completed_at = datetime.now(UTC)
     for user in pending_users:
-        if user.id not in result.failed_user_ids:
+        failed = user.id in result.failed_user_ids
+        if failed:
+            # This cycle actually ranked this profile's inventory and still
+            # came back short, so it counts against the retry budget — unlike
+            # the no-inventory-yet path above, which returns before ranking.
+            user.initial_match_backfill_attempts += 1
+        exhausted = failed and user.initial_match_backfill_attempts >= _MAX_BACKFILL_ATTEMPTS
+        if not failed or exhausted:
             user.initial_matches_generated_at = completed_at
             user.initial_match_backfill_version = _PROFILE_BACKFILL_VERSION
+        if exhausted:
+            # Whatever did rank is already stored as matches; the rest stay
+            # unmatched, exactly as a below-threshold score would. Loud
+            # because a profile reaching this point means the ranker never
+            # covered some postings across every attempt.
+            logger.warning(
+                "profile backfill: user_id=%s giving up after %d incomplete attempts "
+                "— keeping the matches that did rank",
+                user.id,
+                user.initial_match_backfill_attempts,
+            )
         logger.info(
             "profile backfill: user_id=%s considered=%d complete=%s",
             user.id,
             len(rows_by_id),
-            user.id not in result.failed_user_ids,
+            not failed or exhausted,
         )
 
     await session.flush()

@@ -45,6 +45,7 @@ def _ensure_web_profile_columns(connection) -> None:
         "profile_completed_at": "TIMESTAMP WITH TIME ZONE",
         "initial_matches_generated_at": "TIMESTAMP WITH TIME ZONE",
         "initial_match_backfill_version": "INTEGER NOT NULL DEFAULT 0",
+        "initial_match_backfill_attempts": "INTEGER NOT NULL DEFAULT 0",
         "email_digest_enabled": "BOOLEAN NOT NULL DEFAULT true",
         "email_digest_time": "VARCHAR(5) NOT NULL DEFAULT '08:00'",
         "last_email_digest_sent_on": "DATE",

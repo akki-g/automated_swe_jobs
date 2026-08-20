@@ -111,6 +111,57 @@ async def test_signup_records_consent_and_profile_flow(web_app):
 
 
 @pytest.mark.asyncio
+async def test_editing_criteria_restores_the_backfill_retry_budget(web_app):
+    """A profile whose backfill gave up after repeated incomplete rankings
+    must get a fresh retry budget when its criteria change. Without the
+    reset, the exhausted attempt count survives, and the re-run this edit is
+    meant to trigger gives up immediately on its very first cycle."""
+    app, session_factory = web_app
+    async with httpx.AsyncClient(
+        transport=httpx.ASGITransport(app=app), base_url="http://test"
+    ) as client:
+        await client.post(
+            "/api/auth/signup",
+            json={
+                "name": "Alex",
+                "email": "alex@example.com",
+                "password": "a-long-password",
+                "consent": True,
+            },
+        )
+        profile_body = {
+            "name": "Alex",
+            "role_types": ["new_grad"],
+            "target_fields": ["software_engineering"],
+            "keywords": [],
+            "locations": [],
+            "sponsorship_required": False,
+            "freeform_notes": "",
+            "email_digest_enabled": True,
+            "mark_complete": True,
+        }
+        await client.put("/api/profile", headers=_csrf(client), json=profile_body)
+
+        async with session_factory() as session:
+            user = (await session.execute(select(User))).scalar_one()
+            user.initial_match_backfill_attempts = 5
+            user.initial_match_backfill_version = 2
+            await session.commit()
+
+        edited = await client.put(
+            "/api/profile",
+            headers=_csrf(client),
+            json={**profile_body, "target_fields": ["data_science_analytics"]},
+        )
+        assert edited.status_code == 200
+
+    async with session_factory() as session:
+        user = (await session.execute(select(User))).scalar_one()
+        assert user.initial_match_backfill_version == 0
+        assert user.initial_match_backfill_attempts == 0
+
+
+@pytest.mark.asyncio
 async def test_email_settings_update_delivery_time(web_app):
     app, session_factory = web_app
     async with httpx.AsyncClient(
