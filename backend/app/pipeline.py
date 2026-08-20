@@ -32,7 +32,12 @@ _POSTING_KEY_QUERY_BATCH_SIZE = 5_000
 # Version 1 could mark a profile complete when no open inventory existed.
 # Version 2 retries those profiles after deployment and only advances when a
 # non-empty inventory was actually considered without ranking failures.
-_PROFILE_BACKFILL_VERSION = 2
+# Version 3 replaces the bounded newest-N window with a cursor over the whole
+# open corpus, so a profile's matches no longer depend on when it signed up.
+# Bumping the version re-scans every existing profile once; pairs they were
+# already matched on are excluded before ranking, so the re-scan only pays
+# for postings that were previously out of reach.
+_PROFILE_BACKFILL_VERSION = 3
 
 # How many times a profile may be ranked without full coverage before the
 # backfill accepts what it got and stops retrying. Retrying is what recovers
@@ -289,6 +294,7 @@ async def match_new_postings(
     *,
     user_ids: list[int] | None = None,
     match_reason: str = "new_posting",
+    validate_links: bool = True,
 ) -> MatchCycleResult:
     """Rule-filter every new posting against every active user's criteria,
     then batch survivors to Claude for scoring/blurb (see spec: Matching).
@@ -347,13 +353,23 @@ async def match_new_postings(
                 posting_key
             )
 
-    try:
-        dead_keys = await _find_dead_links(new_postings)
-    except Exception:  # noqa: BLE001 - link validation must never sink the whole cycle
-        logger.warning(
-            "match_new_postings: link validation failed unexpectedly", exc_info=True
-        )
-        dead_keys = set()
+    # Link validation is for postings entering the system for the first time
+    # — one check per posting, before anyone can be matched against it. The
+    # profile backfill re-reads the whole back catalogue instead, so checking
+    # there would re-request tens of thousands of employer URLs every cycle
+    # and still tell established users nothing new: their own matches were
+    # never re-validated either. Callers that pass already-known rows opt out
+    # (see backfill_completed_profiles); dead links remain excluded from the
+    # dashboard by api/matches.py's status filter.
+    dead_keys: set[str] = set()
+    if validate_links:
+        try:
+            dead_keys = await _find_dead_links(new_postings)
+        except Exception:  # noqa: BLE001 - link validation must never sink the whole cycle
+            logger.warning(
+                "match_new_postings: link validation failed unexpectedly", exc_info=True
+            )
+            dead_keys = set()
     if dead_keys:
         for row in new_postings:
             if row.posting_key in dead_keys:
@@ -497,13 +513,29 @@ async def backfill_completed_profiles(
     session: AsyncSession,
     rank_client: AnthropicClient,
 ) -> MatchCycleResult:
-    """Seed new web users from recent open inventory.
+    """Evaluate completed profiles against the whole open corpus, one page
+    per cycle.
 
     Normal scrape matching intentionally processes only newly inserted rows.
-    That is efficient for established users, but it means jobs already in the
-    database before a signup are otherwise invisible to that user forever.
-    Process a bounded number of pending profiles and postings per cycle, then
-    mark each profile so the backfill is one-time and restart-safe.
+    That is efficient for established users, but it makes a profile's matches
+    a function of *when it signed up* rather than what it asked for: two
+    identical profiles created a month apart end up with wildly different
+    match counts (observed in production: 2,487 vs 113 for comparable
+    criteria), and everything already in the database at signup is invisible
+    to the newer one.
+
+    Earlier versions narrowed that gap with a one-time pass over the newest
+    N postings per role type, but a bounded window can only ever be a smaller
+    version of the same bug. Instead, each profile carries a cursor over
+    postings.id (see User.initial_match_backfill_cursor) and advances through
+    the entire open corpus a page at a time, completing only once the cursor
+    exhausts it. From then on the fast/slow lanes keep it current, so the
+    steady state is unchanged — the scan is what a profile pays once to catch
+    up with everything that predates it.
+
+    Time still matters, just not signup time: `posted_at` remains available
+    for "new postings" filtering, and staleness/dead-link status decides what
+    counts as open at all.
     """
     pending_users = (
         (
@@ -526,94 +558,130 @@ async def backfill_completed_profiles(
     if not pending_users:
         return MatchCycleResult(instant=[], digest_items=[])
 
-    # Fetch a separate recent window for each requested opportunity type so
-    # a large internship inventory cannot crowd all new-grad rows (or vice
-    # versa) out of the bounded backfill. The shared row set is link-checked
-    # once and match_new_postings still filters it per user.
-    requested_role_types = {
-        role_type
-        for user in pending_users
-        if user.criteria is not None
-        for role_type in (user.criteria.role_types or [])
-    }
-    rows_by_id: dict[int, PostingRow] = {}
-    for role_type in requested_role_types:
-        role_rows = (
+    completed_at = datetime.now(UTC)
+    instant: list[tuple[User, MatchRow, PostingRow]] = []
+    digest_items: list[DigestItem] = []
+    failed_user_ids: set[int] = set()
+
+    page_size = settings.profile_backfill_max_postings_per_user
+    for user in pending_users:
+        # Each profile walks its own cursor, so profiles that joined at
+        # different times can be mid-scan at different offsets without
+        # interfering. Ordered by id (monotonic per insert) rather than
+        # posted_at, which is frequently null and not unique — the scan needs
+        # a total order it can resume from, not a relevance order, since
+        # every page is reached eventually either way.
+        page_conditions = [
+            PostingRow.status == "open",
+            PostingRow.id > user.initial_match_backfill_cursor,
+        ]
+        # Mirror matching.filters' role-type rule in SQL so pages aren't
+        # mostly rows the rule filter is about to discard — most of the
+        # corpus is neither new-grad nor internship, and scanning it anyway
+        # multiplies how long a new profile waits for its first matches.
+        # Empty role_types means "no constraint" there, so it must mean the
+        # same here; an IN clause also excludes unclassified (NULL) rows,
+        # which is what the filter does when role types are set.
+        requested_role_types = list(
+            user.criteria.role_types or [] if user.criteria is not None else []
+        )
+        if requested_role_types:
+            page_conditions.append(PostingRow.role_type.in_(requested_role_types))
+
+        page = (
             (
                 await session.execute(
                     select(PostingRow)
-                    .where(
-                        PostingRow.status == "open", PostingRow.role_type == role_type
-                    )
-                    .order_by(
-                        PostingRow.posted_at.desc().nullslast(),
-                        PostingRow.first_seen_at.desc(),
-                        PostingRow.id.desc(),
-                    )
-                    .limit(settings.profile_backfill_max_postings_per_user)
+                    .where(*page_conditions)
+                    .order_by(PostingRow.id.asc())
+                    .limit(page_size)
                 )
             )
             .scalars()
             .all()
         )
-        rows_by_id.update({row.id: row for row in role_rows})
 
-    if not rows_by_id:
-        # Do not consume the one-time marker before the first successful
-        # scrape (or while all persisted inventory is temporarily stale).
-        # The one-minute scheduler will retry after the slow lane refreshes
-        # inventory. The previous behavior marked these users complete here,
-        # guaranteeing they would never be considered again once jobs arrived.
-        pending_ids = {user.id for user in pending_users}
-        logger.warning(
-            "profile backfill: no open postings for requested role types; "
-            "leaving user_ids=%s pending",
-            sorted(pending_ids),
-        )
-        return MatchCycleResult(
-            instant=[], digest_items=[], failed_user_ids=pending_ids
-        )
-
-    result = await match_new_postings(
-        session,
-        list(rows_by_id.values()),
-        rank_client,
-        lane="backfill",
-        user_ids=[user.id for user in pending_users],
-        match_reason="profile_backfill",
-    )
-    completed_at = datetime.now(UTC)
-    for user in pending_users:
-        failed = user.id in result.failed_user_ids
-        if failed:
-            # This cycle actually ranked this profile's inventory and still
-            # came back short, so it counts against the retry budget — unlike
-            # the no-inventory-yet path above, which returns before ranking.
-            user.initial_match_backfill_attempts += 1
-        exhausted = failed and user.initial_match_backfill_attempts >= _MAX_BACKFILL_ATTEMPTS
-        if not failed or exhausted:
+        if not page:
+            # Cursor exhausted. An empty first page also covers the
+            # fresh-deployment case where no scrape has landed yet: the
+            # profile is only marked complete once inventory exists to have
+            # been considered, so an empty database leaves it pending.
+            if await _open_corpus_is_empty(session):
+                failed_user_ids.add(user.id)
+                logger.warning(
+                    "profile backfill: no open postings yet; leaving user_id=%s pending",
+                    user.id,
+                )
+                continue
             user.initial_matches_generated_at = completed_at
             user.initial_match_backfill_version = _PROFILE_BACKFILL_VERSION
-        if exhausted:
-            # Whatever did rank is already stored as matches; the rest stay
-            # unmatched, exactly as a below-threshold score would. Loud
-            # because a profile reaching this point means the ranker never
-            # covered some postings across every attempt.
-            logger.warning(
-                "profile backfill: user_id=%s giving up after %d incomplete attempts "
-                "— keeping the matches that did rank",
+            logger.info(
+                "profile backfill: user_id=%s complete — whole open corpus considered",
                 user.id,
-                user.initial_match_backfill_attempts,
             )
-        logger.info(
-            "profile backfill: user_id=%s considered=%d complete=%s",
-            user.id,
-            len(rows_by_id),
-            not failed or exhausted,
+            continue
+
+        page_result = await match_new_postings(
+            session,
+            list(page),
+            rank_client,
+            lane="backfill",
+            user_ids=[user.id],
+            match_reason="profile_backfill",
+            validate_links=False,
         )
+        instant.extend(page_result.instant)
+        digest_items.extend(page_result.digest_items)
+
+        failed = user.id in page_result.failed_user_ids
+        if failed:
+            failed_user_ids.add(user.id)
+            user.initial_match_backfill_attempts += 1
+            if user.initial_match_backfill_attempts < _MAX_BACKFILL_ATTEMPTS:
+                # Leave the cursor where it is so the same page is retried.
+                continue
+            # A posting the ranker never returns a result for would otherwise
+            # pin the cursor here forever, stalling the rest of the scan.
+            # Skip the page and keep going: those postings stay unmatched,
+            # exactly as a below-threshold score would.
+            logger.warning(
+                "profile backfill: user_id=%s skipping page ending at posting_id=%d "
+                "after %d incomplete attempts — keeping the matches that did rank",
+                user.id,
+                page[-1].id,
+                _MAX_BACKFILL_ATTEMPTS,
+            )
+
+        # Page dealt with (fully ranked, or given up on): advance past it and
+        # restore the budget, so attempts counts consecutive failures on the
+        # *current* page rather than accumulating across a long healthy scan.
+        user.initial_match_backfill_cursor = page[-1].id
+        user.initial_match_backfill_attempts = 0
+
+        if len(page) < page_size:
+            # A short page is the end of the corpus — no need to spend
+            # another cycle proving the next one is empty. Anything ingested
+            # after this point is new, which is the fast/slow lanes' job.
+            user.initial_matches_generated_at = completed_at
+            user.initial_match_backfill_version = _PROFILE_BACKFILL_VERSION
+            logger.info(
+                "profile backfill: user_id=%s complete — whole open corpus considered",
+                user.id,
+            )
 
     await session.flush()
-    return result
+    return MatchCycleResult(
+        instant=instant, digest_items=digest_items, failed_user_ids=failed_user_ids
+    )
+
+
+async def _open_corpus_is_empty(session: AsyncSession) -> bool:
+    row = (
+        await session.execute(
+            select(PostingRow.id).where(PostingRow.status == "open").limit(1)
+        )
+    ).first()
+    return row is None
 
 
 async def gather_pending_digests(

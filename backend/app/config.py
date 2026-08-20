@@ -49,6 +49,11 @@ class Settings(BaseSettings):
     slow_lane_interval_minutes: int = 15
     profile_backfill_interval_minutes: int = 1
     profile_backfill_max_users_per_cycle: int = 5
+    # Postings scanned per profile *per cycle*, not per profile in total: the
+    # backfill pages through the whole open corpus and stops when the cursor
+    # exhausts it (see pipeline.backfill_completed_profiles). This is the
+    # throughput dial — lower it if backfill cycles start overrunning
+    # profile_backfill_interval_minutes, raise it to catch new profiles up faster.
     profile_backfill_max_postings_per_user: int = 300
     digest_hours: str = "8,20"  # comma-separated hours (local time) for the digest cron
     daily_email_hour: int = 8

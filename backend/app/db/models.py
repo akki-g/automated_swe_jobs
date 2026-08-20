@@ -60,6 +60,12 @@ class User(Base):
     # are sent, so retries need a bound — see
     # pipeline._MAX_BACKFILL_ATTEMPTS.
     initial_match_backfill_attempts: Mapped[int] = mapped_column(Integer, default=0)
+    # Highest postings.id this profile has been evaluated against. The
+    # backfill pages the whole open corpus in id order and only marks the
+    # profile complete once the cursor exhausts it, so a profile's matches
+    # depend on its criteria rather than on when it signed up — see
+    # pipeline.backfill_completed_profiles.
+    initial_match_backfill_cursor: Mapped[int] = mapped_column(Integer, default=0)
     email_digest_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     email_digest_time: Mapped[str] = mapped_column(String(5), default="08:00")
     last_email_digest_sent_on: Mapped[date | None] = mapped_column(Date, nullable=True)

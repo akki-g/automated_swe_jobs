@@ -145,7 +145,8 @@ async def test_editing_criteria_restores_the_backfill_retry_budget(web_app):
         async with session_factory() as session:
             user = (await session.execute(select(User))).scalar_one()
             user.initial_match_backfill_attempts = 5
-            user.initial_match_backfill_version = 2
+            user.initial_match_backfill_version = 3
+            user.initial_match_backfill_cursor = 9999
             await session.commit()
 
         edited = await client.put(
@@ -159,6 +160,10 @@ async def test_editing_criteria_restores_the_backfill_retry_budget(web_app):
         user = (await session.execute(select(User))).scalar_one()
         assert user.initial_match_backfill_version == 0
         assert user.initial_match_backfill_attempts == 0
+        # The cursor must rewind too: new criteria are a different question
+        # to ask of the corpus, so postings already scanned under the old
+        # criteria have to be reconsidered for parity to hold after an edit.
+        assert user.initial_match_backfill_cursor == 0
 
 
 @pytest.mark.asyncio

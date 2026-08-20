@@ -5,12 +5,15 @@ import pytest
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
+from app.config import settings
 from app.db.models import Criteria as CriteriaRow
 from app.db.models import Match as MatchRow
 from app.db.models import Posting as PostingRow
+from app.db.models import User
 from app.db.models import Watchlist as WatchlistRow
 from app.domain.models import Posting, Priority, RoleType
 from app.pipeline import (
+    _PROFILE_BACKFILL_VERSION,
     backfill_completed_profiles,
     match_new_postings,
     store_new_postings,
@@ -61,6 +64,243 @@ class EmptyRankClient:
                 {"type": "tool_use", "name": tools[0]["name"], "input": {"results": []}}
             ]
         }
+
+
+def _completed_web_user(session, *, email: str, **criteria_overrides) -> User:
+    """A finished web signup with criteria — the shape the backfill acts on."""
+    user = User(
+        name=email.split("@")[0],
+        email=email,
+        password_hash="argon2-placeholder",
+        sms_provider="signalwire",
+        opted_out=False,
+        consent_at=datetime.now(UTC),
+        consent_method="web-signup-terms-v1",
+        created_at=datetime.now(UTC),
+        profile_completed_at=datetime.now(UTC),
+    )
+    session.add(user)
+    return user
+
+
+def _criteria_for(user: User, **overrides) -> CriteriaRow:
+    values = dict(
+        role_types=["new_grad"],
+        target_fields=["software_engineering"],
+        keywords=[],
+        locations=[],
+        sponsorship_required=None,
+        freeform_notes="",
+        updated_at=datetime.now(UTC),
+    )
+    values.update(overrides)
+    return CriteriaRow(user_id=user.id, **values)
+
+
+async def _drain_backfill(session, client, *, cycles: int = 50):
+    """Run the one-minute backfill cycle until it stops doing work, the way
+    the scheduler would over several minutes."""
+    for _ in range(cycles):
+        await backfill_completed_profiles(session, client)
+        await session.commit()
+
+
+@pytest.mark.asyncio
+async def test_backfill_covers_the_whole_corpus_not_just_one_page(
+    db_session, demo_user, monkeypatch
+):
+    """The backfill considered only a bounded window of the newest postings
+    and then consumed its one-time marker, so everything older stayed
+    invisible to that user forever. It must page through the entire open
+    corpus instead."""
+    monkeypatch.setattr(settings, "profile_backfill_max_postings_per_user", 3)
+    user = _completed_web_user(db_session, email="new@example.com")
+    await db_session.flush()
+    db_session.add(_criteria_for(user))
+    postings = [_posting(key=f"acme|new grad swe|city{i}") for i in range(10)]
+    await store_new_postings(db_session, postings)
+    await db_session.commit()
+
+    await _drain_backfill(db_session, FakeRankClient())
+
+    matched = {
+        row.posting_key
+        for row in (
+            await db_session.execute(
+                select(PostingRow)
+                .join(MatchRow, MatchRow.posting_id == PostingRow.id)
+                .where(MatchRow.user_id == user.id)
+            )
+        )
+        .scalars()
+        .all()
+    }
+    assert matched == {p.posting_key for p in postings}
+
+
+@pytest.mark.asyncio
+async def test_signup_time_does_not_change_the_match_set(
+    db_session, demo_user, monkeypatch
+):
+    """The requirement, stated directly: two profiles with identical criteria
+    must end up with identical matches regardless of when they signed up.
+
+    `early` is matched the way an established user is — through the lane path,
+    as each posting is ingested. `late` never sees those postings as new and
+    depends entirely on the backfill. Under the bounded window, `late` could
+    only ever reach the newest page of them.
+    """
+    monkeypatch.setattr(settings, "profile_backfill_max_postings_per_user", 3)
+    early = _completed_web_user(db_session, email="early@example.com")
+    await db_session.flush()
+    db_session.add(_criteria_for(early))
+    await db_session.commit()
+
+    # Established user: matched incrementally as inventory arrives.
+    postings = [_posting(key=f"acme|new grad swe|city{i}") for i in range(10)]
+    for posting in postings:
+        new_rows = await store_new_postings(db_session, [posting])
+        await match_new_postings(db_session, new_rows, FakeRankClient())
+        await db_session.commit()
+
+    # Late signup: the same criteria, against inventory that is already old.
+    late = _completed_web_user(db_session, email="late@example.com")
+    await db_session.flush()
+    db_session.add(_criteria_for(late))
+    await db_session.commit()
+
+    await _drain_backfill(db_session, FakeRankClient())
+
+    async def _keys(user_id: int) -> set[str]:
+        return {
+            row.posting_key
+            for row in (
+                await db_session.execute(
+                    select(PostingRow)
+                    .join(MatchRow, MatchRow.posting_id == PostingRow.id)
+                    .where(MatchRow.user_id == user_id)
+                )
+            )
+            .scalars()
+            .all()
+        }
+
+    assert await _keys(late.id) == await _keys(early.id)
+
+
+@pytest.mark.asyncio
+async def test_backfill_stays_pending_until_the_corpus_is_exhausted(
+    db_session, demo_user, monkeypatch
+):
+    """The completion marker means "this profile has seen every open
+    posting", so it must not be set while pages remain."""
+    monkeypatch.setattr(settings, "profile_backfill_max_postings_per_user", 3)
+    user = _completed_web_user(db_session, email="paging@example.com")
+    await db_session.flush()
+    db_session.add(_criteria_for(user))
+    await store_new_postings(
+        db_session, [_posting(key=f"acme|new grad swe|city{i}") for i in range(10)]
+    )
+    await db_session.commit()
+
+    await backfill_completed_profiles(db_session, FakeRankClient())
+    await db_session.commit()
+    await db_session.refresh(user)
+    assert user.initial_match_backfill_version < _PROFILE_BACKFILL_VERSION
+
+    await _drain_backfill(db_session, FakeRankClient())
+    await db_session.refresh(user)
+    assert user.initial_match_backfill_version == _PROFILE_BACKFILL_VERSION
+
+
+@pytest.mark.asyncio
+async def test_backfill_reaches_postings_of_every_requested_role_type(
+    db_session, demo_user, monkeypatch
+):
+    """A large inventory of one opportunity type must not crowd out the
+    other — the original reason for the per-role-type windows, which the
+    full-corpus scan has to keep satisfying."""
+    monkeypatch.setattr(settings, "profile_backfill_max_postings_per_user", 3)
+    user = _completed_web_user(db_session, email="both@example.com")
+    await db_session.flush()
+    db_session.add(_criteria_for(user, role_types=["new_grad", "intern"]))
+    interns = [
+        Posting(
+            posting_key=f"acme|intern swe|city{i}",
+            source="test",
+            company="Acme",
+            title="SWE Intern",
+            url=f"https://example.com/i{i}",
+            location=f"City{i}",
+            role_type=RoleType.INTERN,
+            posted_at=None,
+        )
+        for i in range(8)
+    ]
+    grads = [_posting(key=f"acme|new grad swe|city{i}") for i in range(2)]
+    await store_new_postings(db_session, interns + grads)
+    await db_session.commit()
+
+    await _drain_backfill(db_session, FakeRankClient())
+
+    matched_types = {
+        row.role_type
+        for row in (
+            await db_session.execute(
+                select(PostingRow)
+                .join(MatchRow, MatchRow.posting_id == PostingRow.id)
+                .where(MatchRow.user_id == user.id)
+            )
+        )
+        .scalars()
+        .all()
+    }
+    assert matched_types == {"new_grad", "intern"}
+
+
+@pytest.mark.asyncio
+async def test_backfill_with_no_role_type_selected_still_reaches_everything(
+    db_session, demo_user, monkeypatch
+):
+    """Empty role_types means "no opportunity-type constraint" in
+    matching.filters, so the corpus scan must not narrow on it either —
+    including postings whose role_type the sources never classified."""
+    monkeypatch.setattr(settings, "profile_backfill_max_postings_per_user", 3)
+    user = _completed_web_user(db_session, email="anytype@example.com")
+    await db_session.flush()
+    db_session.add(_criteria_for(user, role_types=[]))
+    unclassified = [
+        Posting(
+            posting_key=f"acme|mystery role|city{i}",
+            source="test",
+            company="Acme",
+            title="Mystery Role",
+            url=f"https://example.com/m{i}",
+            location=f"City{i}",
+            role_type=None,
+            posted_at=None,
+        )
+        for i in range(5)
+    ]
+    grads = [_posting(key=f"acme|new grad swe|city{i}") for i in range(5)]
+    await store_new_postings(db_session, unclassified + grads)
+    await db_session.commit()
+
+    await _drain_backfill(db_session, FakeRankClient())
+
+    matched = {
+        row.posting_key
+        for row in (
+            await db_session.execute(
+                select(PostingRow)
+                .join(MatchRow, MatchRow.posting_id == PostingRow.id)
+                .where(MatchRow.user_id == user.id)
+            )
+        )
+        .scalars()
+        .all()
+    }
+    assert matched == {p.posting_key for p in unclassified + grads}
 
 
 class PermanentlyPartialRankClient:
@@ -128,7 +368,7 @@ async def test_profile_backfill_stops_retrying_a_permanently_partial_ranking(
         await db_session.commit()
 
     await db_session.refresh(demo_user)
-    assert demo_user.initial_match_backfill_version == 2
+    assert demo_user.initial_match_backfill_version == _PROFILE_BACKFILL_VERSION
     assert demo_user.initial_matches_generated_at is not None
 
 
@@ -178,7 +418,7 @@ async def test_waiting_for_inventory_never_burns_the_retry_budget(
 
     assert len(result.digest_items) == 1
     await db_session.refresh(demo_user)
-    assert demo_user.initial_match_backfill_version == 2
+    assert demo_user.initial_match_backfill_version == _PROFILE_BACKFILL_VERSION
 
 
 @pytest.mark.asyncio
@@ -296,7 +536,7 @@ async def test_completed_web_profile_is_backfilled_from_existing_open_postings(
     assert match.match_reason == "profile_backfill"
     await db_session.refresh(demo_user)
     assert demo_user.initial_matches_generated_at is not None
-    assert demo_user.initial_match_backfill_version == 2
+    assert demo_user.initial_match_backfill_version == _PROFILE_BACKFILL_VERSION
 
     # The completion marker and pair-level exclusion make repeat polls safe.
     repeated = await backfill_completed_profiles(db_session, FakeRankClient())
@@ -338,7 +578,7 @@ async def test_profile_backfill_retries_when_ranking_returns_no_results(
     assert len(retried.digest_items) == 1
     await db_session.refresh(demo_user)
     assert demo_user.initial_matches_generated_at is not None
-    assert demo_user.initial_match_backfill_version == 2
+    assert demo_user.initial_match_backfill_version == _PROFILE_BACKFILL_VERSION
 
 
 @pytest.mark.asyncio
@@ -381,7 +621,7 @@ async def test_profile_backfill_does_not_complete_before_open_inventory_exists(
     assert len(retried.digest_items) == 1
     await db_session.refresh(demo_user)
     assert demo_user.initial_matches_generated_at is not None
-    assert demo_user.initial_match_backfill_version == 2
+    assert demo_user.initial_match_backfill_version == _PROFILE_BACKFILL_VERSION
 
 
 @pytest.mark.asyncio

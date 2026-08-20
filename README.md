@@ -32,10 +32,16 @@ Full design: `docs/superpowers/specs/2026-08-07-automated-swe-jobs-design.md`.
   due check catches up after restarts. The legacy 08:00/20:00 SMS digest
   remains separate. Delivery state is channel-aware, so delivery on one
   channel does not suppress another.
-- **New-profile backfill:** a completed profile is matched within about a
-  minute against a bounded window of recent open jobs already in the database.
-  Failed or partial ranking calls leave the profile pending for retry, and
-  pair-level deduplication prevents repeated matches.
+- **Signup date does not affect matches:** a completed profile is matched
+  against the *entire* open corpus, not just jobs posted after it signed up.
+  Each profile carries a cursor over `postings.id` and the one-minute backfill
+  cycle advances it a page at a time, completing only once the corpus is
+  exhausted; from then on the fast/slow lanes keep it current. Two profiles
+  with identical criteria therefore converge on the same matches regardless of
+  when they joined. Editing criteria rewinds the cursor so the corpus is
+  re-evaluated against the new question. Posting *recency* still matters —
+  `posted_at` drives "new jobs" filtering and staleness/dead-link status
+  decides what counts as open — but signup time does not.
 - **Workday:** 14 live-verified Workday boards expand the curated source set
   across banking, investing, consulting, consumer goods, retail, payments,
   media, and generalist employers. Workday enforces 20 results per page, so

@@ -159,6 +159,11 @@ async def update_profile(
         # the re-run give up on its first cycle (see
         # pipeline._MAX_BACKFILL_ATTEMPTS).
         user.initial_match_backfill_attempts = 0
+        # Rewind the corpus scan as well. The cursor records how far these
+        # *old* criteria got; leaving it in place would re-run the backfill
+        # over only the tail of the corpus, which is the signup-time bug in
+        # miniature (see pipeline.backfill_completed_profiles).
+        user.initial_match_backfill_cursor = 0
     criteria.role_types = [value.value for value in body.role_types]
     criteria.target_fields = [value.value for value in body.target_fields]
     criteria.keywords = body.keywords
