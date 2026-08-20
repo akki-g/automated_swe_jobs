@@ -29,6 +29,10 @@ from app.watchlist.service import watchlisted_company_keys_by_user
 logger = logging.getLogger(__name__)
 
 _POSTING_KEY_QUERY_BATCH_SIZE = 5_000
+# Version 1 could mark a profile complete when no open inventory existed.
+# Version 2 retries those profiles after deployment and only advances when a
+# non-empty inventory was actually considered without ranking failures.
+_PROFILE_BACKFILL_VERSION = 2
 
 
 @dataclass
@@ -112,6 +116,14 @@ async def _insert_and_touch(
         row = existing_by_key.get(posting.posting_key)
         if row is not None:
             row.last_seen_at = now
+            # Staleness is an inference from not seeing a posting for several
+            # sweeps, not a terminal state. If a source returns the posting
+            # again, it is open by definition and must become eligible for
+            # new-profile backfills and user-facing matches again. Confirmed
+            # dead links use the separate terminal-ish "closed" state and are
+            # deliberately not reopened here.
+            if row.status == "stale":
+                row.status = "open"
 
     new_postings = filter_new(postings, set(existing_by_key.keys()))
     new_rows: list[PostingRow] = []
@@ -487,7 +499,7 @@ async def backfill_completed_profiles(
                 .where(
                     User.password_hash.is_not(None),
                     User.profile_completed_at.is_not(None),
-                    User.initial_matches_generated_at.is_(None),
+                    User.initial_match_backfill_version < _PROFILE_BACKFILL_VERSION,
                     User.opted_out.is_(False),
                 )
                 .options(selectinload(User.criteria))
@@ -533,6 +545,22 @@ async def backfill_completed_profiles(
         )
         rows_by_id.update({row.id: row for row in role_rows})
 
+    if not rows_by_id:
+        # Do not consume the one-time marker before the first successful
+        # scrape (or while all persisted inventory is temporarily stale).
+        # The one-minute scheduler will retry after the slow lane refreshes
+        # inventory. The previous behavior marked these users complete here,
+        # guaranteeing they would never be considered again once jobs arrived.
+        pending_ids = {user.id for user in pending_users}
+        logger.warning(
+            "profile backfill: no open postings for requested role types; "
+            "leaving user_ids=%s pending",
+            sorted(pending_ids),
+        )
+        return MatchCycleResult(
+            instant=[], digest_items=[], failed_user_ids=pending_ids
+        )
+
     result = await match_new_postings(
         session,
         list(rows_by_id.values()),
@@ -545,6 +573,7 @@ async def backfill_completed_profiles(
     for user in pending_users:
         if user.id not in result.failed_user_ids:
             user.initial_matches_generated_at = completed_at
+            user.initial_match_backfill_version = _PROFILE_BACKFILL_VERSION
         logger.info(
             "profile backfill: user_id=%s considered=%d complete=%s",
             user.id,

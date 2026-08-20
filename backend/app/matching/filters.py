@@ -15,10 +15,17 @@ def matches_criteria(posting: Posting, criteria: Criteria) -> bool:
         # Only exclude on an explicit, known mismatch — if the source didn't
         # report sponsorship info at all, we can't rule the posting out on
         # this basis, so it stays in and other filters decide.
-        if posting_sponsorship is not None and bool(posting_sponsorship) != criteria.sponsorship_required:
+        if (
+            posting_sponsorship is not None
+            and bool(posting_sponsorship) != criteria.sponsorship_required
+        ):
             return False
 
-    if criteria.min_date and posting.posted_at and posting.posted_at < criteria.min_date:
+    if (
+        criteria.min_date
+        and posting.posted_at
+        and posting.posted_at < criteria.min_date
+    ):
         return False
 
     if criteria.locations:
@@ -27,8 +34,18 @@ def matches_criteria(posting: Posting, criteria: Criteria) -> bool:
             return False
 
     if criteria.keywords:
-        haystack = f"{posting.title} {posting.company}".lower()
-        if not any(keyword.lower() in haystack for keyword in criteria.keywords):
+        # Treat keywords as a hard filter only when the source supplies enough
+        # job text to establish a real mismatch. Many list/Workday records
+        # contain only title/company/location; rejecting "Software Engineer"
+        # because its title omits "Python" made broad, relevant inventories
+        # collapse to zero before the ranker ever saw them. With no detailed
+        # text, fail open and let semantic ranking use the user's keywords.
+        title_company = f"{posting.title} {posting.company}".lower()
+        description = (posting.description or "").lower()
+        haystack = f"{title_company} {description}"
+        if description and not any(
+            keyword.lower() in haystack for keyword in criteria.keywords
+        ):
             return False
 
     return True

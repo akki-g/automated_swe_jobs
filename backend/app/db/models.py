@@ -51,6 +51,9 @@ class User(Base):
     initial_matches_generated_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True
     )
+    # Versioned separately from the timestamp so a corrected backfill can
+    # safely reprocess profiles whose older run incorrectly marked success.
+    initial_match_backfill_version: Mapped[int] = mapped_column(Integer, default=0)
     email_digest_enabled: Mapped[bool] = mapped_column(Boolean, default=True)
     email_digest_time: Mapped[str] = mapped_column(String(5), default="08:00")
     last_email_digest_sent_on: Mapped[date | None] = mapped_column(Date, nullable=True)
@@ -104,11 +107,11 @@ class Posting(Base):
     # cap there is the real guarantee; this width is headroom, not the
     # enforcement point.
     posting_key: Mapped[str] = mapped_column(String(500), index=True)
-    source: Mapped[str] = mapped_column(String(50))
+    source: Mapped[str] = mapped_column(String(255))
     company: Mapped[str] = mapped_column(String(255))
     title: Mapped[str] = mapped_column(String(500))
     url: Mapped[str] = mapped_column(String(1000))
-    location: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    location: Mapped[str | None] = mapped_column(String(1000), nullable=True)
     role_type: Mapped[str | None] = mapped_column(String(20), nullable=True)
     posted_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True

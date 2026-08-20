@@ -58,6 +58,30 @@ def test_normalize_preserves_fields_and_computes_key():
     assert posting.posting_key == build_posting_key(raw.company, raw.title, raw.location)
 
 
+def test_normalize_bounds_external_strings_to_database_widths():
+    """One oversized feed value must not roll back every posting in a batch."""
+    raw = RawPosting(
+        source="workday:" + "s" * 300,
+        company="c" * 300,
+        title="t" * 600,
+        url="https://example.com/" + "u" * 1100,
+        location="; ".join(f"City {index}, ST" for index in range(100)),
+        role_type=RoleType.INTERN,
+        posted_at=None,
+        raw={},
+    )
+
+    posting = normalize(raw)
+
+    assert len(posting.source) == 255
+    assert len(posting.company) == 255
+    assert len(posting.title) == 500
+    assert len(posting.url) == 1000
+    assert posting.location is not None
+    assert len(posting.location) == 1000
+    assert len(posting.posting_key) < 500
+
+
 def test_extract_description_prefers_content_key():
     assert extract_description({"content": "<p>Build cool stuff</p>"}) == "Build cool stuff"
 

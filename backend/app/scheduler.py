@@ -300,7 +300,15 @@ async def daily_email_cycle(now: datetime | None = None) -> list[ChannelDigestOu
 
 
 def build_scheduler() -> AsyncIOScheduler:
-    scheduler = AsyncIOScheduler(timezone=settings.scheduler_timezone)
+    # APScheduler's default misfire grace is only one second. A broad source
+    # response can briefly keep the event loop busy parsing/deduplicating
+    # thousands of jobs; production skipped a profile backfill merely because
+    # it started 1.745 seconds late. Coalesce delayed ticks and allow five
+    # minutes so useful work runs once after the process catches up.
+    scheduler = AsyncIOScheduler(
+        timezone=settings.scheduler_timezone,
+        job_defaults={"coalesce": True, "misfire_grace_time": 300},
+    )
     scheduler.add_job(
         fast_lane_cycle,
         "interval",
@@ -312,6 +320,11 @@ def build_scheduler() -> AsyncIOScheduler:
         slow_lane_cycle,
         "interval",
         minutes=settings.slow_lane_interval_minutes,
+        # Refresh persisted inventory immediately after a restart. Otherwise
+        # the first scrape waits 15 minutes while the one-minute profile
+        # backfill sees an empty/stale database. The backfill itself now
+        # retries safely, but eager refresh shortens the empty-dashboard gap.
+        next_run_time=datetime.now(UTC),
         id="slow_lane_cycle",
         max_instances=1,
     )

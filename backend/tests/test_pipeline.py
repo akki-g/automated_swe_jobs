@@ -97,6 +97,7 @@ async def test_completed_web_profile_is_backfilled_from_existing_open_postings(
     assert match.match_reason == "profile_backfill"
     await db_session.refresh(demo_user)
     assert demo_user.initial_matches_generated_at is not None
+    assert demo_user.initial_match_backfill_version == 2
 
     # The completion marker and pair-level exclusion make repeat polls safe.
     repeated = await backfill_completed_profiles(db_session, FakeRankClient())
@@ -131,12 +132,57 @@ async def test_profile_backfill_retries_when_ranking_returns_no_results(
     assert failed.failed_user_ids == {demo_user.id}
     await db_session.refresh(demo_user)
     assert demo_user.initial_matches_generated_at is None
+    assert demo_user.initial_match_backfill_version == 0
 
     retried = await backfill_completed_profiles(db_session, FakeRankClient())
     await db_session.commit()
     assert len(retried.digest_items) == 1
     await db_session.refresh(demo_user)
     assert demo_user.initial_matches_generated_at is not None
+    assert demo_user.initial_match_backfill_version == 2
+
+
+@pytest.mark.asyncio
+async def test_profile_backfill_does_not_complete_before_open_inventory_exists(
+    db_session, demo_user
+):
+    """Regression for the production restart sequence: the one-minute
+    backfill can run before the first slow-lane scrape. An empty inventory
+    must leave the profile pending rather than permanently consuming its
+    one-time marker."""
+    demo_user.password_hash = "argon2-placeholder"
+    demo_user.profile_completed_at = datetime.now(UTC)
+    db_session.add(
+        CriteriaRow(
+            user_id=demo_user.id,
+            role_types=["new_grad"],
+            target_fields=["software_engineering"],
+            keywords=[],
+            locations=[],
+            sponsorship_required=None,
+            freeform_notes="",
+            updated_at=datetime.now(UTC),
+        )
+    )
+    await db_session.commit()
+
+    empty_attempt = await backfill_completed_profiles(db_session, FakeRankClient())
+    await db_session.commit()
+
+    assert empty_attempt.failed_user_ids == {demo_user.id}
+    await db_session.refresh(demo_user)
+    assert demo_user.initial_matches_generated_at is None
+    assert demo_user.initial_match_backfill_version == 0
+
+    await store_new_postings(db_session, [_posting()])
+    await db_session.commit()
+    retried = await backfill_completed_profiles(db_session, FakeRankClient())
+    await db_session.commit()
+
+    assert len(retried.digest_items) == 1
+    await db_session.refresh(demo_user)
+    assert demo_user.initial_matches_generated_at is not None
+    assert demo_user.initial_match_backfill_version == 2
 
 
 @pytest.mark.asyncio
@@ -151,6 +197,21 @@ async def test_store_new_postings_is_idempotent_across_calls(db_session):
 
     all_rows = (await db_session.execute(select(PostingRow))).scalars().all()
     assert len(all_rows) == 1
+
+
+@pytest.mark.asyncio
+async def test_store_new_postings_reopens_stale_posting_when_seen_again(db_session):
+    posting = _posting()
+    rows = await store_new_postings(db_session, [posting])
+    rows[0].status = "stale"
+    await db_session.commit()
+
+    new_rows = await store_new_postings(db_session, [posting])
+    await db_session.commit()
+
+    assert new_rows == []
+    stored = (await db_session.execute(select(PostingRow))).scalar_one()
+    assert stored.status == "open"
 
 
 @pytest.mark.asyncio

@@ -184,6 +184,8 @@ def test_scheduler_keeps_sms_digest_and_adds_daily_email_job():
         job for job in scheduler.get_jobs() if job.id == "daily_email_cycle"
     )
     assert str(email_job.trigger) == "cron[minute='*']"
+    assert scheduler._job_defaults["misfire_grace_time"] == 300
+    assert scheduler._job_defaults["coalesce"] is True
 
 
 @pytest.mark.asyncio

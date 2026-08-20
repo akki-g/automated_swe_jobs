@@ -26,6 +26,22 @@ _WHITESPACE_PATTERN = re.compile(r"\s+")
 # for already-deployed databases).
 _MAX_COMPONENT_LENGTH = 150
 
+# These are the persistence limits from db/models.py. Source payloads are
+# untrusted and routinely exceed the display-oriented widths we started
+# with: the GitHub internship feed currently contains multi-office location
+# strings over 500 characters, and one Workday source name is 51 characters.
+# Apply the limits before SQLAlchemy builds a batch INSERT so a single record
+# can never roll the whole ingestion transaction back with StringDataRightTruncation.
+_MAX_SOURCE_LENGTH = 255
+_MAX_COMPANY_LENGTH = 255
+_MAX_TITLE_LENGTH = 500
+_MAX_URL_LENGTH = 1000
+_MAX_LOCATION_LENGTH = 1000
+
+
+def _cap_storage_value(value: str, limit: int) -> str:
+    return value[:limit]
+
 
 def _normalize_component(value: str | None) -> str:
     if not value:
@@ -92,11 +108,15 @@ def extract_description(raw: dict) -> str | None:
 def normalize(raw: RawPosting) -> Posting:
     return Posting(
         posting_key=build_posting_key(raw.company, raw.title, raw.location),
-        source=raw.source,
-        company=raw.company,
-        title=raw.title,
-        url=raw.url,
-        location=raw.location,
+        source=_cap_storage_value(raw.source, _MAX_SOURCE_LENGTH),
+        company=_cap_storage_value(raw.company, _MAX_COMPANY_LENGTH),
+        title=_cap_storage_value(raw.title, _MAX_TITLE_LENGTH),
+        url=_cap_storage_value(raw.url, _MAX_URL_LENGTH),
+        location=(
+            _cap_storage_value(raw.location, _MAX_LOCATION_LENGTH)
+            if raw.location is not None
+            else None
+        ),
         role_type=raw.role_type,
         posted_at=raw.posted_at,
         raw=raw.raw,

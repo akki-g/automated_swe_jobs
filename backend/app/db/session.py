@@ -44,6 +44,7 @@ def _ensure_web_profile_columns(connection) -> None:
         "password_hash": "VARCHAR(255)",
         "profile_completed_at": "TIMESTAMP WITH TIME ZONE",
         "initial_matches_generated_at": "TIMESTAMP WITH TIME ZONE",
+        "initial_match_backfill_version": "INTEGER NOT NULL DEFAULT 0",
         "email_digest_enabled": "BOOLEAN NOT NULL DEFAULT true",
         "email_digest_time": "VARCHAR(5) NOT NULL DEFAULT '08:00'",
         "last_email_digest_sent_on": "DATE",
@@ -154,6 +155,27 @@ def _ensure_web_profile_columns(connection) -> None:
                 connection.exec_driver_sql(
                     "ALTER TABLE postings ALTER COLUMN posting_key TYPE VARCHAR(500)"
                 )
+
+            # Public feeds are not bounded by our original display-oriented
+            # widths. In August 2026 the live internship feed included
+            # locations up to 541 characters, while the Unilever Workday
+            # source identifier was 51 characters. Either one makes asyncpg
+            # reject the entire multi-row INSERT against the old VARCHAR(255)
+            # / VARCHAR(50) columns, leaving zero new postings to match.
+            for column, width in (("source", 255), ("location", 1000)):
+                too_narrow = connection.execute(
+                    text(
+                        "SELECT 1 FROM information_schema.columns "
+                        "WHERE table_name = 'postings' AND column_name = :column "
+                        "AND character_maximum_length < :width"
+                    ),
+                    {"column": column, "width": width},
+                ).first()
+                if too_narrow:
+                    connection.exec_driver_sql(
+                        f"ALTER TABLE postings ALTER COLUMN {column} "
+                        f"TYPE VARCHAR({width})"
+                    )
 
     _backfill_truncated_posting_keys(connection, inspector)
 

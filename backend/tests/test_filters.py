@@ -59,10 +59,28 @@ def test_keyword_filter_matches_title_or_company():
     assert matches_criteria(posting, criteria) is True
 
 
-def test_keyword_filter_excludes_no_match():
-    posting = _posting(title="Sales Associate")
+def test_keyword_filter_matches_description():
+    posting = _posting(
+        title="Software Engineer",
+        description="Build Python services and distributed data pipelines.",
+    )
+    criteria = _criteria(keywords=("python",))
+    assert matches_criteria(posting, criteria) is True
+
+
+def test_keyword_filter_excludes_known_description_mismatch():
+    posting = _posting(
+        title="Sales Associate",
+        description="Sell consumer retail products in a storefront.",
+    )
     criteria = _criteria(keywords=("software", "engineer"))
     assert matches_criteria(posting, criteria) is False
+
+
+def test_keyword_filter_fails_open_when_source_has_no_detailed_text():
+    posting = _posting(title="Software Engineer", description=None)
+    criteria = _criteria(keywords=("python",))
+    assert matches_criteria(posting, criteria) is True
 
 
 def test_min_date_filter_excludes_older_postings():

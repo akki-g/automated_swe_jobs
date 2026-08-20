@@ -153,6 +153,7 @@ async def update_profile(
         # pairs are excluded by the pipeline, so this only adds newly fitting
         # rows rather than duplicating prior results.
         user.initial_matches_generated_at = None
+        user.initial_match_backfill_version = 0
     criteria.role_types = [value.value for value in body.role_types]
     criteria.target_fields = [value.value for value in body.target_fields]
     criteria.keywords = body.keywords
